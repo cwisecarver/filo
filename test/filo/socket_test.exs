@@ -130,6 +130,61 @@ defmodule Filo.SocketTest do
     assert resp["response"]["result"]["rows"] == [[%{"type" => "integer", "value" => "1"}]]
   end
 
+  test "a cursor runs a batch and fetches its entries incrementally, then closes" do
+    state = open_socket() |> hello() |> open_stream(1)
+
+    open = %{
+      "type" => "open_cursor",
+      "stream_id" => 1,
+      "cursor_id" => 7,
+      "batch" => %{"steps" => [%{"stmt" => %{"sql" => "SELECT 1"}}]}
+    }
+
+    {opened, state} = pushed(send_msg(state, req(2, open)))
+    assert opened["response"] == %{"type" => "open_cursor"}
+
+    # first fetch: step_begin + row, more remain
+    fetch = %{"type" => "fetch_cursor", "cursor_id" => 7, "max_count" => 2}
+    {f1, state} = pushed(send_msg(state, req(3, fetch)))
+    assert f1["response"]["type"] == "fetch_cursor"
+    assert f1["response"]["done"] == false
+    assert [%{"type" => "step_begin"}, %{"type" => "row"}] = f1["response"]["entries"]
+
+    # second fetch: step_end, done
+    {f2, state} = pushed(send_msg(state, req(4, %{fetch | "max_count" => 10})))
+    assert [%{"type" => "step_end"}] = f2["response"]["entries"]
+    assert f2["response"]["done"] == true
+
+    {closed, _state} =
+      pushed(send_msg(state, req(5, %{"type" => "close_cursor", "cursor_id" => 7})))
+
+    assert closed["response"] == %{"type" => "close_cursor"}
+  end
+
+  test "open_cursor on an unknown stream is a response_error" do
+    state = open_socket() |> hello()
+
+    open = %{
+      "type" => "open_cursor",
+      "stream_id" => 99,
+      "cursor_id" => 1,
+      "batch" => %{"steps" => []}
+    }
+
+    {resp, _state} = pushed(send_msg(state, req(1, open)))
+    assert resp["type"] == "response_error"
+    assert resp["error"]["code"] == "STREAM_NOT_FOUND"
+  end
+
+  test "fetch_cursor on an unknown cursor is a response_error" do
+    state = open_socket() |> hello()
+
+    fetch = %{"type" => "fetch_cursor", "cursor_id" => 123, "max_count" => 5}
+    {resp, _state} = pushed(send_msg(state, req(1, fetch)))
+    assert resp["type"] == "response_error"
+    assert resp["error"]["code"] == "CURSOR_NOT_FOUND"
+  end
+
   test "opening a stream id that already exists is a response_error" do
     state = open_socket() |> hello() |> open_stream(1)
 

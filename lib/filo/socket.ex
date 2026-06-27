@@ -18,9 +18,12 @@ defmodule Filo.Socket do
     - `open_stream` / `close_stream` — open and release a connection; the client
       allocates the `stream_id`. A connection lives for the life of its stream,
       so state (transactions, temp tables) persists across requests.
-    - `execute` / `batch` / `describe` / `get_autocommit` — run against a stream.
+    - `execute` / `batch` / `sequence` / `describe` / `get_autocommit` — run
+      against a stream.
     - `store_sql` / `close_sql` — cache SQL text under a `sql_id` for the
       connection, referenced by later statements.
+    - `open_cursor` / `fetch_cursor` / `close_cursor` (Hrana 3) — run a batch and
+      read its results incrementally as cursor entries.
 
   The per-request payloads reuse the shared protocol core (`Filo.Stmt`,
   `Filo.Batch`, `Filo.Request`, …) — only the framing and stream bookkeeping are
@@ -30,9 +33,9 @@ defmodule Filo.Socket do
 
   @behaviour WebSock
 
-  alias Filo.{Error, Request}
+  alias Filo.{Batch, Cursor, Error, Request}
 
-  defstruct [:executor, :open_arg, hello?: false, streams: %{}, sqls: %{}]
+  defstruct [:executor, :open_arg, hello?: false, streams: %{}, sqls: %{}, cursors: %{}]
 
   @doc """
   Initializes a connection's handler state.
@@ -135,6 +138,52 @@ defmodule Filo.Socket do
 
   defp handle_request(%{"type" => "close_sql", "sql_id" => sql_id}, state) do
     {{:ok, %{"type" => "close_sql"}}, %{state | sqls: Map.delete(state.sqls, sql_id)}}
+  end
+
+  defp handle_request(
+         %{"type" => "open_cursor", "stream_id" => sid, "cursor_id" => cid, "batch" => batch},
+         state
+       ) do
+    cond do
+      Map.has_key?(state.cursors, cid) ->
+        {{:error, encode(error("cursor #{cid} already open", "CURSOR_EXISTS"))}, state}
+
+      not Map.has_key?(state.streams, sid) ->
+        {{:error, encode(error("stream #{sid} not found", "STREAM_NOT_FOUND"))}, state}
+
+      true ->
+        conn = Map.fetch!(state.streams, sid)
+        %{"batch" => batch} = resolve_sql(%{"batch" => batch}, state.sqls)
+
+        result =
+          batch
+          |> Batch.decode()
+          |> Batch.run(
+            &state.executor.execute(conn, &1),
+            fn -> state.executor.autocommit?(conn) end
+          )
+
+        entries = Cursor.entries(result)
+
+        {{:ok, %{"type" => "open_cursor"}},
+         %{state | cursors: Map.put(state.cursors, cid, entries)}}
+    end
+  end
+
+  defp handle_request(%{"type" => "fetch_cursor", "cursor_id" => cid} = request, state) do
+    case Map.fetch(state.cursors, cid) do
+      {:ok, entries} ->
+        {taken, rest} = Enum.split(entries, Map.get(request, "max_count", 0))
+        response = %{"type" => "fetch_cursor", "entries" => taken, "done" => rest == []}
+        {{:ok, response}, %{state | cursors: Map.put(state.cursors, cid, rest)}}
+
+      :error ->
+        {{:error, encode(error("cursor #{cid} not found", "CURSOR_NOT_FOUND"))}, state}
+    end
+  end
+
+  defp handle_request(%{"type" => "close_cursor", "cursor_id" => cid}, state) do
+    {{:ok, %{"type" => "close_cursor"}}, %{state | cursors: Map.delete(state.cursors, cid)}}
   end
 
   defp handle_request(%{"type" => type, "stream_id" => sid} = request, state)
