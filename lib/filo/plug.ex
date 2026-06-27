@@ -1,12 +1,17 @@
 defmodule Filo.Plug do
   @moduledoc """
-  A `Plug` that speaks Hrana 3 over HTTP. Mount it in any Plug or Phoenix app to
-  accept libSQL clients (`django-libsql`, `libsql-client`, the libSQL SDKs).
+  A `Plug` that speaks Hrana over HTTP (versions 1, 2, and 3) and upgrades
+  WebSocket requests to `Filo.Socket` (Hrana over WebSocket). Mount it in any Plug
+  or Phoenix app to accept libSQL clients (`django-libsql` over ws, `libsql-client`,
+  `libsql-experimental`, the libSQL SDKs).
 
   ## Routes
 
-    - `GET /v3` — protocol-support check; replies `200`.
-    - `POST /v3/pipeline` — runs a pipeline of stream requests.
+    - `GET /v1` · `/v2` · `/v3` — protocol-support checks; reply `200`.
+    - `POST /v2/pipeline` · `/v3/pipeline` — run a pipeline of stream requests.
+    - `POST /v3/cursor` — run a batch, streaming the result (Hrana 3).
+    - `POST /v1/execute` · `/v1/batch` — stateless Hrana 1 legacy API.
+    - A WebSocket upgrade (any path) is handed to `Filo.Socket`.
 
   ## Configuration (`init/1`)
 
@@ -34,7 +39,7 @@ defmodule Filo.Plug do
 
   import Plug.Conn
 
-  alias Filo.{Baton, BatchResult, Cursor, Error, Stream, Streams}
+  alias Filo.{Baton, Batch, BatchResult, Cursor, Error, Stmt, StmtResult, Stream, Streams}
 
   @max_body 8_000_000
 
@@ -59,10 +64,10 @@ defmodule Filo.Plug do
     end
   end
 
-  # Version-support checks. Hrana 2 and 3 over HTTP share the pipeline shape, so
-  # both are served; v3 additionally offers the cursor endpoint below.
+  # Version-support checks. Hrana 1 (legacy /v1/execute + /v1/batch), 2, and 3 are
+  # all served; v2/v3 share the pipeline shape, v3 adds the cursor endpoint.
   defp route(%Plug.Conn{method: "GET", path_info: [version]} = conn, _opts)
-       when version in ~w(v2 v3) do
+       when version in ~w(v1 v2 v3) do
     send_resp(conn, 200, "Filo: Hrana over HTTP (#{version})")
   end
 
@@ -74,6 +79,16 @@ defmodule Filo.Plug do
   # Cursor is a Hrana 3 addition: it runs a batch and streams the result.
   defp route(%Plug.Conn{method: "POST", path_info: ["v3", "cursor"]} = conn, opts) do
     handle_cursor(conn, opts)
+  end
+
+  # Hrana 1 (legacy HTTP API): stateless execute/batch, no baton — each runs on a
+  # fresh connection.
+  defp route(%Plug.Conn{method: "POST", path_info: ["v1", "execute"]} = conn, opts) do
+    handle_v1_execute(conn, opts)
+  end
+
+  defp route(%Plug.Conn{method: "POST", path_info: ["v1", "batch"]} = conn, opts) do
+    handle_v1_batch(conn, opts)
   end
 
   defp route(conn, _opts), do: send_resp(conn, 404, "not found")
@@ -248,6 +263,89 @@ defmodule Filo.Plug do
 
   defp new_stream_opts(opts, conn),
     do: [executor: opts.executor, open_arg: open_arg(opts, conn)] ++ idle_opt(opts)
+
+  # --- Hrana 1 legacy HTTP API: stateless, one fresh connection per request ---
+
+  defp handle_v1_execute(conn, opts) do
+    case read_request(conn) do
+      {:ok, %{"stmt" => stmt}, conn} ->
+        result =
+          with_conn(opts, conn, fn db ->
+            case opts.executor.execute(db, Stmt.decode(stmt)) do
+              {:ok, stmt_result} -> {:ok, %{"result" => StmtResult.encode(stmt_result)}}
+              {:error, %Error{} = error} -> {:error, error}
+            end
+          end)
+
+        respond_v1(conn, result)
+
+      {:ok, _no_stmt, conn} ->
+        send_json(
+          conn,
+          400,
+          Error.encode(%Error{message: "missing stmt", code: "FILO_BAD_REQUEST"})
+        )
+
+      {:error, :bad_json, conn} ->
+        send_json(
+          conn,
+          400,
+          Error.encode(%Error{message: "invalid JSON body", code: "FILO_BAD_REQUEST"})
+        )
+    end
+  end
+
+  defp handle_v1_batch(conn, opts) do
+    case read_request(conn) do
+      {:ok, %{"batch" => batch}, conn} ->
+        result =
+          with_conn(opts, conn, fn db ->
+            batch_result =
+              batch
+              |> Batch.decode()
+              |> Batch.run(
+                &opts.executor.execute(db, &1),
+                fn -> opts.executor.autocommit?(db) end
+              )
+
+            {:ok, %{"result" => BatchResult.encode(batch_result)}}
+          end)
+
+        respond_v1(conn, result)
+
+      {:ok, _no_batch, conn} ->
+        send_json(
+          conn,
+          400,
+          Error.encode(%Error{message: "missing batch", code: "FILO_BAD_REQUEST"})
+        )
+
+      {:error, :bad_json, conn} ->
+        send_json(
+          conn,
+          400,
+          Error.encode(%Error{message: "invalid JSON body", code: "FILO_BAD_REQUEST"})
+        )
+    end
+  end
+
+  # Opens a fresh connection, runs `fun`, and always closes it.
+  defp with_conn(opts, conn, fun) do
+    case opts.executor.open(open_arg(opts, conn)) do
+      {:ok, db} ->
+        try do
+          fun.(db)
+        after
+          opts.executor.close(db)
+        end
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
+  end
+
+  defp respond_v1(conn, {:ok, body}), do: send_json(conn, 200, body)
+  defp respond_v1(conn, {:error, %Error{} = error}), do: send_json(conn, 400, Error.encode(error))
 
   defp decode_baton(baton, key) do
     case Baton.decode(baton, key) do

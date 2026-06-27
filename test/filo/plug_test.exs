@@ -92,6 +92,38 @@ defmodule Filo.PlugTest do
     assert response["result"]["rows"] == [[%{"type" => "integer", "value" => "1"}]]
   end
 
+  test "POST /v1/execute runs a single statement statelessly", %{opts: opts} do
+    conn =
+      conn(:post, "/v1/execute", Jason.encode!(%{"stmt" => %{"sql" => "SELECT 1"}}))
+      |> put_req_header("content-type", "application/json")
+      |> Filo.Plug.call(opts)
+
+    assert conn.status == 200
+    assert decoded(conn)["result"]["rows"] == [[%{"type" => "integer", "value" => "1"}]]
+  end
+
+  test "POST /v1/batch runs a batch statelessly", %{opts: opts} do
+    body = %{"batch" => %{"steps" => [%{"stmt" => %{"sql" => "SELECT 1"}}]}}
+
+    conn =
+      conn(:post, "/v1/batch", Jason.encode!(body))
+      |> put_req_header("content-type", "application/json")
+      |> Filo.Plug.call(opts)
+
+    assert conn.status == 200
+    assert [%{"affected_row_count" => _} | _] = decoded(conn)["result"]["step_results"]
+  end
+
+  test "POST /v1/execute surfaces a SQL error as a 400 Hrana error", %{opts: opts} do
+    conn =
+      conn(:post, "/v1/execute", Jason.encode!(%{"stmt" => %{"sql" => "BOOM"}}))
+      |> put_req_header("content-type", "application/json")
+      |> Filo.Plug.call(opts)
+
+    assert conn.status == 400
+    assert decoded(conn)["code"] == "SQLITE_ERROR"
+  end
+
   test "the returned baton authorizes the next request on the same stream", %{opts: opts} do
     first = decoded(post_pipeline(opts, %{"baton" => nil, "requests" => [execute_req()]}))
     baton1 = first["baton"]
