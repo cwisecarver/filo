@@ -59,11 +59,15 @@ defmodule Filo.Plug do
     end
   end
 
-  defp route(%Plug.Conn{method: "GET", path_info: ["v3"]} = conn, _opts) do
-    send_resp(conn, 200, "Filo: Hrana over HTTP (v3)")
+  # Version-support checks. Hrana 2 and 3 over HTTP share the pipeline shape, so
+  # both are served; v3 additionally offers the cursor endpoint below.
+  defp route(%Plug.Conn{method: "GET", path_info: [version]} = conn, _opts)
+       when version in ~w(v2 v3) do
+    send_resp(conn, 200, "Filo: Hrana over HTTP (#{version})")
   end
 
-  defp route(%Plug.Conn{method: "POST", path_info: ["v3", "pipeline"]} = conn, opts) do
+  defp route(%Plug.Conn{method: "POST", path_info: [version, "pipeline"]} = conn, opts)
+       when version in ~w(v2 v3) do
     handle_pipeline(conn, opts)
   end
 

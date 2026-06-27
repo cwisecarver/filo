@@ -60,6 +60,23 @@ defmodule Filo.PlugTest do
     assert conn.status == 200
   end
 
+  test "GET /v2 also reports protocol support", %{opts: opts} do
+    conn = Filo.Plug.call(conn(:get, "/v2"), opts)
+    assert conn.status == 200
+  end
+
+  test "POST /v2/pipeline runs the same pipeline as v3", %{opts: opts} do
+    conn =
+      conn(:post, "/v2/pipeline", Jason.encode!(%{"baton" => nil, "requests" => [execute_req()]}))
+      |> put_req_header("content-type", "application/json")
+      |> Filo.Plug.call(opts)
+
+    assert conn.status == 200
+    resp = decoded(conn)
+    assert is_binary(resp["baton"])
+    assert [%{"type" => "ok", "response" => %{"type" => "execute"}}] = resp["results"]
+  end
+
   test "POST /v3/pipeline with no baton opens a stream and runs the pipeline", %{opts: opts} do
     conn = post_pipeline(opts, %{"baton" => nil, "requests" => [execute_req()]})
 
