@@ -9,6 +9,7 @@ defmodule Filo.MixProject do
       app: :filo,
       version: @version,
       elixir: "~> 1.20",
+      elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       aliases: aliases(),
@@ -30,10 +31,20 @@ defmodule Filo.MixProject do
     [preferred_envs: [precommit: :test]]
   end
 
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
+
   defp deps do
     [
       {:plug, "~> 1.16"},
       {:jason, "~> 1.4"},
+      # The WebSock behaviour for the Hrana-over-WebSocket handler. Behaviour
+      # only (like Plug) — the host brings the actual server (Bandit/Cowboy).
+      {:websock, "~> 0.5"},
+      # Test-only: a real HTTP/WebSocket server to run libsql clients against
+      # Filo end to end. The library itself ships a Plug and a WebSock handler
+      # and never depends on a server.
+      {:bandit, "~> 1.0", only: :test},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end
