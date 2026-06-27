@@ -45,6 +45,18 @@ defmodule Filo.Request do
     end
   end
 
+  def handle(executor, conn, %{"type" => "sequence", "sql" => sql}) when is_binary(sql) do
+    if function_exported?(executor, :execute_sequence, 2) do
+      case executor.execute_sequence(conn, sql) do
+        :ok -> {:open, ok(%{"type" => "sequence"})}
+        {:error, %Error{} = error} -> {:open, stream_error(error)}
+      end
+    else
+      {:open,
+       stream_error(%Error{message: "sequence is not supported", code: "FILO_UNSUPPORTED"})}
+    end
+  end
+
   def handle(executor, conn, %{"type" => "get_autocommit"}) do
     {:open, ok(%{"type" => "get_autocommit", "is_autocommit" => executor.autocommit?(conn)})}
   end

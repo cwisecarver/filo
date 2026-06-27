@@ -138,7 +138,7 @@ defmodule Filo.Socket do
   end
 
   defp handle_request(%{"type" => type, "stream_id" => sid} = request, state)
-       when type in ~w(execute batch describe get_autocommit) do
+       when type in ~w(execute batch sequence describe get_autocommit) do
     case Map.fetch(state.streams, sid) do
       {:ok, conn} ->
         inner = request |> Map.delete("stream_id") |> resolve_sql(state.sqls)
@@ -165,6 +165,14 @@ defmodule Filo.Socket do
   defp resolve_sql(%{"batch" => %{"steps" => steps} = batch} = request, sqls) do
     steps = Enum.map(steps, &resolve_step(&1, sqls))
     %{request | "batch" => %{batch | "steps" => steps}}
+  end
+
+  defp resolve_sql(%{"type" => "sequence", "sql_id" => sql_id} = request, sqls)
+       when not is_map_key(request, "sql") do
+    case Map.fetch(sqls, sql_id) do
+      {:ok, sql} -> request |> Map.delete("sql_id") |> Map.put("sql", sql)
+      :error -> request
+    end
   end
 
   defp resolve_sql(request, _sqls), do: request

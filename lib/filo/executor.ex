@@ -39,5 +39,12 @@ defmodule Filo.Executor do
   @callback describe(conn(), sql :: String.t()) ::
               {:ok, Filo.Describe.t()} | {:error, Filo.Error.t()}
 
-  @optional_callbacks describe: 2
+  @doc """
+  Runs a SQL script — one or more statements — for its side effects, returning no
+  rows. Used by the Hrana `sequence` request. Optional: an executor that does not
+  implement it makes `sequence` requests fail with an "unsupported" error.
+  """
+  @callback execute_sequence(conn(), sql :: String.t()) :: :ok | {:error, Filo.Error.t()}
+
+  @optional_callbacks describe: 2, execute_sequence: 2
 end

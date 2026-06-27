@@ -19,6 +19,9 @@ defmodule Filo.SocketTest.Echo do
     send(test, {:closed, ref})
     :ok
   end
+
+  @impl true
+  def execute_sequence({_test, _ref}, _sql), do: :ok
 end
 
 defmodule Filo.SocketTest do
@@ -101,6 +104,15 @@ defmodule Filo.SocketTest do
     {resp, _state} = pushed(send_msg(state, req(2, batch)))
     assert resp["response"]["type"] == "batch"
     assert [%{"affected_row_count" => _} | _] = resp["response"]["result"]["step_results"]
+  end
+
+  test "sequence runs a script over a stream" do
+    state = open_socket() |> hello() |> open_stream(1)
+
+    seq = %{"type" => "sequence", "stream_id" => 1, "sql" => "CREATE TABLE t(x); SELECT 1"}
+    {resp, _state} = pushed(send_msg(state, req(2, seq)))
+    assert resp["type"] == "response_ok"
+    assert resp["response"] == %{"type" => "sequence"}
   end
 
   test "a stored SQL can be executed by sql_id" do

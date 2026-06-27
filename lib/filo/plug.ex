@@ -51,15 +51,58 @@ defmodule Filo.Plug do
   end
 
   @impl true
-  def call(%Plug.Conn{method: "GET", path_info: ["v3"]} = conn, _opts) do
+  def call(conn, opts) do
+    if websocket_upgrade?(conn) do
+      upgrade(conn, opts)
+    else
+      route(conn, opts)
+    end
+  end
+
+  defp route(%Plug.Conn{method: "GET", path_info: ["v3"]} = conn, _opts) do
     send_resp(conn, 200, "Filo: Hrana over HTTP (v3)")
   end
 
-  def call(%Plug.Conn{method: "POST", path_info: ["v3", "pipeline"]} = conn, opts) do
+  defp route(%Plug.Conn{method: "POST", path_info: ["v3", "pipeline"]} = conn, opts) do
     handle_pipeline(conn, opts)
   end
 
-  def call(conn, _opts), do: send_resp(conn, 404, "not found")
+  defp route(conn, _opts), do: send_resp(conn, 404, "not found")
+
+  # A WebSocket upgrade on any path is handed to Filo.Socket (Hrana over WS),
+  # so one mount serves both the HTTP pipeline and the WebSocket binding.
+  defp upgrade(conn, opts) do
+    socket_opts = [executor: opts.executor, open_arg: open_arg(opts, conn)]
+
+    conn
+    |> negotiate_subprotocol()
+    |> Plug.Conn.upgrade_adapter(:websocket, {Filo.Socket, socket_opts, []})
+  end
+
+  @subprotocols ~w(hrana3 hrana2 hrana1)
+
+  defp negotiate_subprotocol(conn) do
+    offered = conn |> get_req_header("sec-websocket-protocol") |> Enum.flat_map(&tokens/1)
+
+    case Enum.find(@subprotocols, &(&1 in offered)) do
+      nil -> conn
+      chosen -> put_resp_header(conn, "sec-websocket-protocol", chosen)
+    end
+  end
+
+  defp websocket_upgrade?(conn) do
+    conn.method == "GET" and header_token?(conn, "upgrade", "websocket") and
+      header_token?(conn, "connection", "upgrade")
+  end
+
+  defp header_token?(conn, name, token) do
+    conn
+    |> get_req_header(name)
+    |> Enum.flat_map(&tokens/1)
+    |> Enum.any?(&(String.downcase(&1) == token))
+  end
+
+  defp tokens(value), do: value |> String.split(",") |> Enum.map(&String.trim/1)
 
   defp handle_pipeline(conn, opts) do
     case read_request(conn) do
