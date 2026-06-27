@@ -386,9 +386,10 @@ defmodule Filo.Protobuf do
 
   ## --- field helpers (presence-aware, proto3) ---
 
-  defp string_field(_field, nil), do: []
-  defp string_field(_field, ""), do: []
-  defp string_field(field, v) when is_binary(v), do: Wire.field_len(field, v)
+  @doc false
+  def string_field(_field, nil), do: []
+  def string_field(_field, ""), do: []
+  def string_field(field, v) when is_binary(v), do: Wire.field_len(field, v)
 
   defp int_field(_field, nil), do: []
   defp int_field(field, v) when is_integer(v), do: Wire.field_int(field, v)
@@ -412,14 +413,16 @@ defmodule Filo.Protobuf do
     end
   end
 
-  defp take_string(fields, num, default) do
+  @doc false
+  def take_string(fields, num, default) do
     case field_value(fields, num) do
       {:len, v} -> v
       _ -> default
     end
   end
 
-  defp take_varint(fields, num, default) do
+  @doc false
+  def take_varint(fields, num, default) do
     case field_value(fields, num) do
       {:varint, v} -> v
       _ -> default
@@ -440,21 +443,24 @@ defmodule Filo.Protobuf do
     end
   end
 
-  defp take_len(fields, num) do
+  @doc false
+  def take_len(fields, num) do
     case field_value(fields, num) do
       {:len, v} -> v
       _ -> nil
     end
   end
 
-  defp collect_len(fields, num) do
+  @doc false
+  def collect_len(fields, num) do
     for {f, {:len, b}} <- fields, f == num, do: b
   end
 
   ## --- value helpers ---
 
-  defp put_if(map, _key, nil), do: map
-  defp put_if(map, key, value), do: Map.put(map, key, value)
+  @doc false
+  def put_if(map, _key, nil), do: map
+  def put_if(map, key, value), do: Map.put(map, key, value)
 
   defp to_int(v) when is_integer(v), do: v
   defp to_int(v) when is_binary(v), do: String.to_integer(v)

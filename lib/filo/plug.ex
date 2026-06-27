@@ -7,9 +7,11 @@ defmodule Filo.Plug do
 
   ## Routes
 
-    - `GET /v1` · `/v2` · `/v3` — protocol-support checks; reply `200`.
-    - `POST /v2/pipeline` · `/v3/pipeline` — run a pipeline of stream requests.
-    - `POST /v3/cursor` — run a batch, streaming the result (Hrana 3).
+    - `GET /v1` · `/v2` · `/v3` · `/v3-protobuf` — protocol-support checks; reply `200`.
+    - `POST /v2/pipeline` · `/v3/pipeline` — run a pipeline of stream requests (JSON).
+    - `POST /v3-protobuf/pipeline` — same, Protobuf-encoded (`application/x-protobuf`).
+    - `POST /v3/cursor` — run a batch, streaming the result (Hrana 3, JSON).
+    - `POST /v3-protobuf/cursor` — same, length-delimited Protobuf frames.
     - `POST /v1/execute` · `/v1/batch` — stateless Hrana 1 legacy API.
     - A WebSocket upgrade (any path) is handed to `Filo.Socket`.
 
@@ -40,6 +42,8 @@ defmodule Filo.Plug do
   import Plug.Conn
 
   alias Filo.{Baton, Batch, BatchResult, Cursor, Error, Stmt, StmtResult, Stream, Streams}
+  alias Filo.Protobuf
+  alias Filo.Protobuf.Wire
 
   @max_body 8_000_000
 
@@ -67,18 +71,26 @@ defmodule Filo.Plug do
   # Version-support checks. Hrana 1 (legacy /v1/execute + /v1/batch), 2, and 3 are
   # all served; v2/v3 share the pipeline shape, v3 adds the cursor endpoint.
   defp route(%Plug.Conn{method: "GET", path_info: [version]} = conn, _opts)
-       when version in ~w(v1 v2 v3) do
+       when version in ~w(v1 v2 v3 v3-protobuf) do
     send_resp(conn, 200, "Filo: Hrana over HTTP (#{version})")
   end
 
   defp route(%Plug.Conn{method: "POST", path_info: [version, "pipeline"]} = conn, opts)
        when version in ~w(v2 v3) do
-    handle_pipeline(conn, opts)
+    handle_pipeline(conn, opts, :json)
+  end
+
+  defp route(%Plug.Conn{method: "POST", path_info: ["v3-protobuf", "pipeline"]} = conn, opts) do
+    handle_pipeline(conn, opts, :protobuf)
   end
 
   # Cursor is a Hrana 3 addition: it runs a batch and streams the result.
   defp route(%Plug.Conn{method: "POST", path_info: ["v3", "cursor"]} = conn, opts) do
-    handle_cursor(conn, opts)
+    handle_cursor(conn, opts, :json)
+  end
+
+  defp route(%Plug.Conn{method: "POST", path_info: ["v3-protobuf", "cursor"]} = conn, opts) do
+    handle_cursor(conn, opts, :protobuf)
   end
 
   # Hrana 1 (legacy HTTP API): stateless execute/batch, no baton — each runs on a
@@ -128,7 +140,7 @@ defmodule Filo.Plug do
 
   defp tokens(value), do: value |> String.split(",") |> Enum.map(&String.trim/1)
 
-  defp handle_pipeline(conn, opts) do
+  defp handle_pipeline(conn, opts, :json) do
     case read_request(conn) do
       {:ok, body, conn} ->
         baton = Map.get(body, "baton")
@@ -152,6 +164,32 @@ defmodule Filo.Plug do
           400,
           Error.encode(%Error{message: "invalid JSON body", code: "FILO_BAD_REQUEST"})
         )
+    end
+  end
+
+  defp handle_pipeline(conn, opts, :protobuf) do
+    case read_all(conn, "") do
+      {:ok, body, conn} ->
+        decoded = Protobuf.Http.decode_pipeline_req(body)
+
+        case dispatch(opts, conn, Map.get(decoded, "baton"), Map.get(decoded, "requests", [])) do
+          {:ok, new_baton, results} ->
+            send_protobuf(
+              conn,
+              200,
+              Protobuf.Http.encode_pipeline_resp(%{
+                "baton" => new_baton,
+                "base_url" => opts.base_url,
+                "results" => results
+              })
+            )
+
+          {:error, status, %Error{} = error} ->
+            send_protobuf(conn, status, Protobuf.encode_error(Error.encode(error)))
+        end
+
+      {:error, conn} ->
+        send_protobuf(conn, 400, bad_request_pb())
     end
   end
 
@@ -191,7 +229,7 @@ defmodule Filo.Plug do
       {:error, 400, %Error{message: "stream not found", code: "STREAM_NOT_FOUND"}}
   end
 
-  defp handle_cursor(conn, opts) do
+  defp handle_cursor(conn, opts, :json) do
     case read_request(conn) do
       {:ok, %{"batch" => batch} = body, conn} ->
         case dispatch_cursor(opts, conn, Map.get(body, "baton"), batch) do
@@ -220,6 +258,43 @@ defmodule Filo.Plug do
           400,
           Error.encode(%Error{message: "invalid JSON body", code: "FILO_BAD_REQUEST"})
         )
+    end
+  end
+
+  defp handle_cursor(conn, opts, :protobuf) do
+    case read_all(conn, "") do
+      {:ok, body, conn} ->
+        decoded = Protobuf.Http.decode_cursor_req(body)
+
+        case Map.get(decoded, "batch") do
+          nil ->
+            send_protobuf(conn, 400, bad_request_pb("missing batch"))
+
+          batch ->
+            case dispatch_cursor(opts, conn, Map.get(decoded, "baton"), batch) do
+              {:ok, new_baton, entries} ->
+                # Response is a stream of length-delimited protobufs: the
+                # CursorRespBody first, then one CursorEntry per entry.
+                head =
+                  Protobuf.Http.encode_cursor_resp(%{
+                    "baton" => new_baton,
+                    "base_url" => opts.base_url
+                  })
+
+                frames = [
+                  Wire.delimit(head)
+                  | Enum.map(entries, &Wire.delimit(Protobuf.encode_cursor_entry(&1)))
+                ]
+
+                send_protobuf(conn, 200, frames)
+
+              {:error, status, %Error{} = error} ->
+                send_protobuf(conn, status, Protobuf.encode_error(Error.encode(error)))
+            end
+        end
+
+      {:error, conn} ->
+        send_protobuf(conn, 400, bad_request_pb())
     end
   end
 
@@ -398,5 +473,16 @@ defmodule Filo.Plug do
     conn
     |> put_resp_content_type("application/json")
     |> send_resp(status, Jason.encode!(body))
+  end
+
+  defp send_protobuf(conn, status, body) do
+    conn
+    # Binary body — no charset (would be wrong for protobuf).
+    |> put_resp_content_type("application/x-protobuf", nil)
+    |> send_resp(status, IO.iodata_to_binary(body))
+  end
+
+  defp bad_request_pb(message \\ "invalid protobuf body") do
+    Protobuf.encode_error(%{"message" => message, "code" => "FILO_BAD_REQUEST"})
   end
 end

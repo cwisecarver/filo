@@ -75,6 +75,18 @@ defmodule Filo.Protobuf.Wire do
 
   ## --- decoding ---
 
+  @doc "Splits a length-delimited stream (the inverse of repeated `delimit/1`) into messages."
+  @spec split_delimited(binary()) :: [binary()]
+  def split_delimited(bin), do: split_delimited(bin, [])
+
+  defp split_delimited(<<>>, acc), do: Enum.reverse(acc)
+
+  defp split_delimited(bin, acc) do
+    {len, rest} = decode_varint(bin)
+    <<msg::binary-size(^len), rest::binary>> = rest
+    split_delimited(rest, [msg | acc])
+  end
+
   @doc "Decodes a `fixed64` double payload."
   @spec decode_double(binary()) :: float()
   def decode_double(<<f::little-float-64>>), do: f
