@@ -93,6 +93,23 @@ defmodule Filo.StreamTest do
     assert {:ok, :open, _, 8} = Stream.run(pid, 7, [execute_req()])
   end
 
+  test "run_cursor executes a batch and returns the raw result with a rotated seq" do
+    pid = start_stream(seq: 0)
+
+    batch = %{"steps" => [%{"stmt" => %{"sql" => "SELECT 1"}}]}
+
+    assert {:ok, %Filo.BatchResult{step_results: [result], step_errors: [nil]}, 1} =
+             Stream.run_cursor(pid, 0, batch)
+
+    assert %Filo.StmtResult{rows: [[1]]} = result
+  end
+
+  test "run_cursor rejects a mismatched seq" do
+    pid = start_stream(seq: 5)
+
+    assert {:error, :baton_reused} = Stream.run_cursor(pid, 99, %{"steps" => []})
+  end
+
   test "a close request releases the connection and terminates the stream" do
     pid = start_stream(seq: 0)
     ref = Process.monitor(pid)

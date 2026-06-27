@@ -34,7 +34,7 @@ defmodule Filo.Plug do
 
   import Plug.Conn
 
-  alias Filo.{Baton, Error, Stream, Streams}
+  alias Filo.{Baton, BatchResult, Cursor, Error, Stream, Streams}
 
   @max_body 8_000_000
 
@@ -69,6 +69,11 @@ defmodule Filo.Plug do
   defp route(%Plug.Conn{method: "POST", path_info: [version, "pipeline"]} = conn, opts)
        when version in ~w(v2 v3) do
     handle_pipeline(conn, opts)
+  end
+
+  # Cursor is a Hrana 3 addition: it runs a batch and streams the result.
+  defp route(%Plug.Conn{method: "POST", path_info: ["v3", "cursor"]} = conn, opts) do
+    handle_cursor(conn, opts)
   end
 
   defp route(conn, _opts), do: send_resp(conn, 404, "not found")
@@ -137,10 +142,7 @@ defmodule Filo.Plug do
 
   # No baton: open a fresh stream, then run the pipeline against it.
   defp dispatch(opts, conn, nil, requests) do
-    stream_opts =
-      [executor: opts.executor, open_arg: open_arg(opts, conn)] ++ idle_opt(opts)
-
-    case Streams.create(opts.streams, stream_opts) do
+    case Streams.create(opts.streams, new_stream_opts(opts, conn)) do
       {:ok, stream_id, seq, pid} ->
         run(opts, stream_id, pid, seq, requests)
 
@@ -173,6 +175,79 @@ defmodule Filo.Plug do
     :exit, _ ->
       {:error, 400, %Error{message: "stream not found", code: "STREAM_NOT_FOUND"}}
   end
+
+  defp handle_cursor(conn, opts) do
+    case read_request(conn) do
+      {:ok, %{"batch" => batch} = body, conn} ->
+        case dispatch_cursor(opts, conn, Map.get(body, "baton"), batch) do
+          {:ok, new_baton, entries} ->
+            head = %{"baton" => new_baton, "base_url" => opts.base_url}
+
+            conn
+            |> put_resp_content_type("text/plain")
+            |> send_chunked(200)
+            |> stream_lines([head | entries])
+
+          {:error, status, %Error{} = error} ->
+            send_json(conn, status, Error.encode(error))
+        end
+
+      {:ok, _no_batch, conn} ->
+        send_json(
+          conn,
+          400,
+          Error.encode(%Error{message: "missing batch", code: "FILO_BAD_REQUEST"})
+        )
+
+      {:error, :bad_json, conn} ->
+        send_json(
+          conn,
+          400,
+          Error.encode(%Error{message: "invalid JSON body", code: "FILO_BAD_REQUEST"})
+        )
+    end
+  end
+
+  # Cursor responses are newline-delimited JSON: the CursorRespBody, then entries.
+  defp stream_lines(conn, items) do
+    Enum.reduce(items, conn, fn item, conn ->
+      {:ok, conn} = chunk(conn, [Jason.encode!(item), "\n"])
+      conn
+    end)
+  end
+
+  defp dispatch_cursor(opts, conn, nil, batch) do
+    case Streams.create(opts.streams, new_stream_opts(opts, conn)) do
+      {:ok, stream_id, seq, pid} ->
+        run_cursor(opts, stream_id, pid, seq, batch)
+
+      {:error, _reason} ->
+        {:error, 500, %Error{message: "could not open stream", code: "FILO_OPEN_FAILED"}}
+    end
+  end
+
+  defp dispatch_cursor(opts, _conn, baton, batch) when is_binary(baton) do
+    with {:ok, {stream_id, seq}} <- decode_baton(baton, opts.key),
+         {:ok, pid} <- find_stream(opts.streams, stream_id) do
+      run_cursor(opts, stream_id, pid, seq, batch)
+    end
+  end
+
+  defp run_cursor(opts, stream_id, pid, seq, batch) do
+    case Stream.run_cursor(pid, seq, batch) do
+      {:ok, %BatchResult{} = result, next_seq} ->
+        {:ok, Baton.encode(stream_id, next_seq, opts.key), Cursor.entries(result)}
+
+      {:error, :baton_reused} ->
+        {:error, 400, %Error{message: "baton reused", code: "BATON_REUSED"}}
+    end
+  catch
+    :exit, _ ->
+      {:error, 400, %Error{message: "stream not found", code: "STREAM_NOT_FOUND"}}
+  end
+
+  defp new_stream_opts(opts, conn),
+    do: [executor: opts.executor, open_arg: open_arg(opts, conn)] ++ idle_opt(opts)
 
   defp decode_baton(baton, key) do
     case Baton.decode(baton, key) do

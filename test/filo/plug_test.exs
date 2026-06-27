@@ -149,14 +149,37 @@ defmodule Filo.PlugTest do
     assert conn.status == 400
   end
 
-  test "unknown routes are 404", %{opts: opts} do
-    assert Filo.Plug.call(conn(:get, "/nope"), opts).status == 404
+  test "POST /v3/cursor streams batch results as newline-delimited entries", %{opts: opts} do
+    body = %{"baton" => nil, "batch" => %{"steps" => [%{"stmt" => %{"sql" => "SELECT 1"}}]}}
 
-    cursor =
-      conn(:post, "/v3/cursor", "{}")
+    conn =
+      conn(:post, "/v3/cursor", Jason.encode!(body))
       |> put_req_header("content-type", "application/json")
       |> Filo.Plug.call(opts)
 
-    assert cursor.status == 404
+    assert conn.status == 200
+
+    [head | entries] =
+      conn.resp_body |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+
+    assert is_binary(head["baton"])
+    assert head["base_url"] == @base_url
+
+    assert [
+             %{"type" => "step_begin", "step" => 0, "cols" => [%{"name" => "n"}]},
+             %{"type" => "row", "row" => [%{"type" => "integer", "value" => "1"}]},
+             %{"type" => "step_end", "affected_row_count" => 0}
+           ] = entries
+  end
+
+  test "unknown routes are 404", %{opts: opts} do
+    assert Filo.Plug.call(conn(:get, "/nope"), opts).status == 404
+
+    unknown =
+      conn(:post, "/v9/pipeline", "{}")
+      |> put_req_header("content-type", "application/json")
+      |> Filo.Plug.call(opts)
+
+    assert unknown.status == 404
   end
 end

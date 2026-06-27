@@ -32,7 +32,7 @@ defmodule Filo.Stream do
 
   import Bitwise
 
-  alias Filo.Request
+  alias Filo.{Batch, Request}
 
   @default_idle_timeout 10_000
   @u64_mask 0xFFFFFFFFFFFFFFFF
@@ -76,6 +76,18 @@ defmodule Filo.Stream do
     GenServer.call(server, {:run, seq, requests})
   end
 
+  @doc """
+  Runs a decoded Hrana batch map against the stream for a cursor, returning the
+  raw `Filo.BatchResult` (which the caller streams as cursor entries) and the
+  rotated sequence. Like `run/3`, a mismatched `seq` is `{:error, :baton_reused}`.
+  The stream stays open.
+  """
+  @spec run_cursor(GenServer.server(), non_neg_integer(), map()) ::
+          {:ok, Filo.BatchResult.t(), non_neg_integer()} | {:error, :baton_reused}
+  def run_cursor(server, seq, batch) do
+    GenServer.call(server, {:run_cursor, seq, batch})
+  end
+
   @impl true
   def init(opts) do
     executor = Keyword.fetch!(opts, :executor)
@@ -117,6 +129,24 @@ defmodule Filo.Stream do
         # there is nothing left for us to close — just stop.
         {:stop, :normal, {:ok, :closed, results, nil}, %{state | conn: nil}}
     end
+  end
+
+  def handle_call({:run_cursor, seq, _batch}, _from, %{seq: expected} = state)
+      when seq != expected do
+    {:reply, {:error, :baton_reused}, state}
+  end
+
+  def handle_call({:run_cursor, _seq, batch}, _from, state) do
+    result =
+      batch
+      |> Batch.decode()
+      |> Batch.run(
+        &state.executor.execute(state.conn, &1),
+        fn -> state.executor.autocommit?(state.conn) end
+      )
+
+    next = state.seq + 1 &&& @u64_mask
+    {:reply, {:ok, result, next}, arm_timer(%{state | seq: next})}
   end
 
   @impl true
