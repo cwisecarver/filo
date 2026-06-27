@@ -30,4 +30,14 @@ defmodule Filo.Executor do
 
   @doc "Releases the connection when its stream closes."
   @callback close(conn()) :: :ok
+
+  @doc """
+  Describes a statement without running it — its parameters, columns, and whether
+  it is an `EXPLAIN` or read-only. Optional: an executor that does not implement
+  it makes `describe` requests fail with an "unsupported" stream error.
+  """
+  @callback describe(conn(), sql :: String.t()) ::
+              {:ok, Filo.Describe.t()} | {:error, Filo.Error.t()}
+
+  @optional_callbacks describe: 2
 end

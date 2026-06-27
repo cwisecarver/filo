@@ -17,6 +17,10 @@ defmodule Filo.RequestTest.FakeExecutor do
 
   @impl true
   def close(:conn), do: :ok
+
+  @impl true
+  def describe(:conn, "BOOM"), do: {:error, %Filo.Error{message: "boom", code: "SQLITE_ERROR"}}
+  def describe(:conn, _sql), do: {:ok, %Filo.Describe{cols: ["n"], is_readonly: true}}
 end
 
 defmodule Filo.RequestTest do
@@ -58,10 +62,26 @@ defmodule Filo.RequestTest do
     assert result == %{"type" => "ok", "response" => %{"type" => "close"}}
   end
 
+  test "describe -> open + ok/describe response with the statement shape" do
+    req = %{"type" => "describe", "sql" => "SELECT 1"}
+    assert {:open, result} = Request.handle(FakeExecutor, :conn, req)
+    assert result["response"]["type"] == "describe"
+    assert result["response"]["result"]["cols"] == [%{"name" => "n", "decltype" => nil}]
+    assert result["response"]["result"]["is_readonly"] == true
+  end
+
+  test "describe failure -> error stream result" do
+    req = %{"type" => "describe", "sql" => "BOOM"}
+
+    assert {:open,
+            %{"type" => "error", "error" => %{"message" => "boom", "code" => "SQLITE_ERROR"}}} =
+             Request.handle(FakeExecutor, :conn, req)
+  end
+
   test "unsupported request type -> error stream result, stream stays open" do
     assert {:open, %{"type" => "error", "error" => %{"message" => message}}} =
-             Request.handle(FakeExecutor, :conn, %{"type" => "describe", "sql" => "SELECT 1"})
+             Request.handle(FakeExecutor, :conn, %{"type" => "sequence", "sql" => "SELECT 1"})
 
-    assert message =~ "describe"
+    assert message =~ "sequence"
   end
 end

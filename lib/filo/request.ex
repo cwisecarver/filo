@@ -8,7 +8,7 @@ defmodule Filo.Request do
   `StreamResult` map — `%{"type" => "ok", ...}` or `%{"type" => "error", ...}`.
   """
 
-  alias Filo.{Batch, BatchResult, Error, Stmt, StmtResult}
+  alias Filo.{Batch, BatchResult, Describe, Error, Stmt, StmtResult}
 
   @type status :: :open | :closed
 
@@ -28,6 +28,21 @@ defmodule Filo.Request do
       |> Batch.run(&executor.execute(conn, &1), fn -> executor.autocommit?(conn) end)
 
     {:open, ok(%{"type" => "batch", "result" => BatchResult.encode(result)})}
+  end
+
+  def handle(executor, conn, %{"type" => "describe", "sql" => sql}) when is_binary(sql) do
+    if function_exported?(executor, :describe, 2) do
+      case executor.describe(conn, sql) do
+        {:ok, %Describe{} = describe} ->
+          {:open, ok(%{"type" => "describe", "result" => Describe.encode(describe)})}
+
+        {:error, %Error{} = error} ->
+          {:open, stream_error(error)}
+      end
+    else
+      {:open,
+       stream_error(%Error{message: "describe is not supported", code: "FILO_UNSUPPORTED"})}
+    end
   end
 
   def handle(executor, conn, %{"type" => "get_autocommit"}) do
