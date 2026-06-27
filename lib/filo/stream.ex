@@ -30,9 +30,12 @@ defmodule Filo.Stream do
 
   use GenServer
 
+  import Bitwise
+
   alias Filo.Request
 
   @default_idle_timeout 10_000
+  @u64_mask 0xFFFFFFFFFFFFFFFF
 
   defstruct [:executor, :conn, :seq, :idle_timeout, :timer]
 
@@ -104,7 +107,9 @@ defmodule Filo.Stream do
   def handle_call({:run, _seq, requests}, _from, state) do
     case run_pipeline(state, requests) do
       {:open, results} ->
-        next = state.seq + 1
+        # Wrap at 2^64 so the seq always fits the baton's u64 field, matching
+        # libsql's wrapping_add.
+        next = state.seq + 1 &&& @u64_mask
         {:reply, {:ok, :open, results, next}, arm_timer(%{state | seq: next})}
 
       {:closed, results} ->

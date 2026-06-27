@@ -78,6 +78,13 @@ defmodule Filo.StreamTest do
     assert {:ok, :open, _, 3} = Stream.run(pid, 2, [execute_req()])
   end
 
+  test "the seq wraps at the u64 boundary so it always encodes as a baton" do
+    max_u64 = 0xFFFFFFFFFFFFFFFF
+    pid = start_stream(seq: max_u64)
+
+    assert {:ok, :open, _, 0} = Stream.run(pid, max_u64, [execute_req()])
+  end
+
   test "a request presenting the wrong seq is rejected as baton reuse, without running" do
     pid = start_stream(seq: 7)
 
