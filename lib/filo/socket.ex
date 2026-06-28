@@ -10,7 +10,8 @@ defmodule Filo.Socket do
 
   ## Protocol
 
-  After the WebSocket opens (subprotocol `hrana2`/`hrana3`), the client sends a
+  After the WebSocket opens (subprotocol `hrana2`/`hrana3`, or `hrana3-protobuf`
+  for the binary Protobuf encoding), the client sends a
   `hello` and the server replies `hello_ok`. Thereafter every message is a
   `request` carrying a `request_id`, answered by a `response_ok` or
   `response_error` with the same id. Requests:
@@ -35,34 +36,61 @@ defmodule Filo.Socket do
 
   alias Filo.{Batch, Cursor, Error, Request}
 
-  defstruct [:executor, :open_arg, hello?: false, streams: %{}, sqls: %{}, cursors: %{}]
+  defstruct [
+    :executor,
+    :open_arg,
+    encoding: :json,
+    hello?: false,
+    streams: %{},
+    sqls: %{},
+    cursors: %{}
+  ]
 
   @doc """
   Initializes a connection's handler state.
 
-  Options: `:executor` (required, the `Filo.Executor` module) and `:open_arg`
-  (host context passed to `executor.open/1` for each stream).
+  Options: `:executor` (required, the `Filo.Executor` module), `:open_arg`
+  (host context passed to `executor.open/1` for each stream), and `:encoding`
+  (`:json` (default) or `:protobuf`, set from the negotiated subprotocol).
   """
   @impl true
   def init(opts) do
     state = %__MODULE__{
       executor: Keyword.fetch!(opts, :executor),
-      open_arg: Keyword.get(opts, :open_arg)
+      open_arg: Keyword.get(opts, :open_arg),
+      encoding: Keyword.get(opts, :encoding, :json)
     }
 
     {:ok, state}
   end
 
   @impl true
-  def handle_in({text, [opcode: :text]}, state) do
+  def handle_in({text, [opcode: :text]}, %{encoding: :json} = state) do
     case Jason.decode(text) do
       {:ok, message} -> handle_message(message, state)
       {:error, _} -> {:stop, :normal, state}
     end
   end
 
-  # Hrana is a text protocol; reject binary frames.
-  def handle_in({_data, [opcode: :binary]}, state), do: {:stop, :normal, state}
+  def handle_in({data, [opcode: :binary]}, %{encoding: :protobuf} = state) do
+    case safe_decode_client_msg(data) do
+      {:ok, message} -> handle_message(message, state)
+      :error -> {:stop, :normal, state}
+    end
+  end
+
+  # The frame type must match the negotiated encoding (Hrana 3 spec): a binary
+  # frame under JSON, or a text frame under Protobuf, is a protocol violation.
+  def handle_in({_data, _opts}, state), do: {:stop, :normal, state}
+
+  defp safe_decode_client_msg(data) do
+    case Filo.Protobuf.Ws.decode_client_msg(data) do
+      nil -> :error
+      message -> {:ok, message}
+    end
+  rescue
+    _ -> :error
+  end
 
   # Filo never sends itself process messages — it only replies to client frames.
   @impl true
@@ -239,6 +267,10 @@ defmodule Filo.Socket do
   end
 
   defp resolve_stmt(stmt, _sqls), do: stmt
+
+  defp push(message, %{encoding: :protobuf} = state) do
+    {:push, {:binary, IO.iodata_to_binary(Filo.Protobuf.Ws.encode_server_msg(message))}, state}
+  end
 
   defp push(message, state), do: {:push, {:text, Jason.encode!(message)}, state}
 

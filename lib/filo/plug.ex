@@ -108,23 +108,28 @@ defmodule Filo.Plug do
   # A WebSocket upgrade on any path is handed to Filo.Socket (Hrana over WS),
   # so one mount serves both the HTTP pipeline and the WebSocket binding.
   defp upgrade(conn, opts) do
-    socket_opts = [executor: opts.executor, open_arg: open_arg(opts, conn)]
+    {conn, encoding} = negotiate_subprotocol(conn)
+    socket_opts = [executor: opts.executor, open_arg: open_arg(opts, conn), encoding: encoding]
 
     conn
-    |> negotiate_subprotocol()
     |> Plug.Conn.upgrade_adapter(:websocket, {Filo.Socket, socket_opts, []})
   end
 
-  @subprotocols ~w(hrana3 hrana2 hrana1)
+  # JSON variants are listed first, so a client offering both JSON and Protobuf
+  # gets JSON; a Protobuf-only client (`hrana3-protobuf`) gets the binary encoding.
+  @subprotocols ~w(hrana3 hrana2 hrana1 hrana3-protobuf)
 
   defp negotiate_subprotocol(conn) do
     offered = conn |> get_req_header("sec-websocket-protocol") |> Enum.flat_map(&tokens/1)
 
     case Enum.find(@subprotocols, &(&1 in offered)) do
-      nil -> conn
-      chosen -> put_resp_header(conn, "sec-websocket-protocol", chosen)
+      nil -> {conn, :json}
+      chosen -> {put_resp_header(conn, "sec-websocket-protocol", chosen), encoding_for(chosen)}
     end
   end
+
+  defp encoding_for("hrana3-protobuf"), do: :protobuf
+  defp encoding_for(_), do: :json
 
   defp websocket_upgrade?(conn) do
     conn.method == "GET" and header_token?(conn, "upgrade", "websocket") and
