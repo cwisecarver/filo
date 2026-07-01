@@ -4,7 +4,8 @@ A [Hrana](https://github.com/tursodatabase/libsql/blob/main/docs/HRANA_3_SPEC.md
 (libSQL) protocol **server** for Elixir.
 
 Hrana is the wire protocol spoken by libSQL clients — the official libSQL SDKs,
-`django-libsql`, `sqlalchemy-libsql`, and friends. Filo implements the **server**
+[`django-libsql`](https://github.com/aaronkazah/django-libsql),
+[`sqlalchemy-libsql`](https://github.com/tursodatabase/sqlalchemy-libsql), and friends. Filo implements the **server**
 side of Hrana-over-HTTP, so any SQLite-backed Elixir app can accept those clients
 over the network with no changes on the client.
 
