@@ -10,31 +10,39 @@ permissions:
 
 jobs:
   test:
-    name: mix precommit
+    name: mix precommit (OTP ${{ matrix.otp }})
     runs-on: ubuntu-latest
     env:
       MIX_ENV: test
+
+    strategy:
+      # Elixir stays at 1.20.1 (the project requires ~> 1.20); we vary OTP to catch VM-version
+      # issues. fail-fast off so one OTP's result doesn't cancel the others.
+      fail-fast: false
+      matrix:
+        otp: ["27", "28", "29"]
+
     steps:
       - uses: actions/checkout@v4
 
-      # Pinned to the toolchain the project develops on (Elixir ~> 1.20). setup-beam pulls
-      # precompiled builds, so no BEAM install cost. exqlite (test-only) compiles its bundled
-      # SQLite from source with the runner's default C toolchain — no system packages needed.
+      # setup-beam pulls precompiled builds, so no BEAM install cost. exqlite (test-only) compiles
+      # its bundled SQLite from source with the runner's default C toolchain — no system packages.
       - name: Set up Elixir/OTP
         uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.20.1"
-          otp-version: "29"
+          otp-version: ${{ matrix.otp }}
 
       - name: Cache deps and _build
         uses: actions/cache@v4
         with:
+          # _build artifacts are OTP-specific, so key the cache on the OTP version too.
           path: |
             deps
             _build
-          key: ${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
+          key: ${{ runner.os }}-otp${{ matrix.otp }}-mix-${{ hashFiles('**/mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-mix-
+            ${{ runner.os }}-otp${{ matrix.otp }}-mix-
 
       - name: Install dependencies
         run: mix deps.get
