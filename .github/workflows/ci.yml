@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: mix precommit
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to the toolchain the project develops on (Elixir ~> 1.20). setup-beam pulls
+      # precompiled builds, so no BEAM install cost. exqlite (test-only) compiles its bundled
+      # SQLite from source with the runner's default C toolchain — no system packages needed.
+      - name: Set up Elixir/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20.1"
+          otp-version: "29"
+
+      - name: Cache deps and _build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      # The project's own gate: compile --warnings-as-errors, deps.unlock --unused,
+      # format --check-formatted, and the test suite (integration tests, which need a real
+      # libsql client, are excluded by test_helper.exs — run with --include integration).
+      - name: Run checks
+        run: mix precommit
