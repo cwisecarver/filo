@@ -19,6 +19,26 @@ defmodule Filo.PlugTest.Echo do
   def close(:conn), do: :ok
 end
 
+defmodule Filo.PlugTest.FailOpen do
+  @moduledoc false
+  # An executor whose open/1 refuses with a client-error Filo.Error (status 400) — e.g. a missing
+  # or invalid shard. The pipeline path must surface that status, not a blanket 500.
+  @behaviour Filo.Executor
+
+  @impl true
+  def open(_arg),
+    do: {:error, %Filo.Error{message: "no shard specified", code: "FILO_NO_SHARD", status: 400}}
+
+  @impl true
+  def execute(_conn, _stmt), do: {:ok, %Filo.StmtResult{}}
+
+  @impl true
+  def autocommit?(_conn), do: true
+
+  @impl true
+  def close(_conn), do: :ok
+end
+
 defmodule Filo.PlugTest do
   # Shares a globally-named Filo.Streams supervisor, so not concurrent.
   use ExUnit.Case, async: false
@@ -90,6 +110,21 @@ defmodule Filo.PlugTest do
     assert [%{"type" => "ok", "response" => response}] = resp["results"]
     assert response["type"] == "execute"
     assert response["result"]["rows"] == [[%{"type" => "integer", "value" => "1"}]]
+  end
+
+  test "a stream open that fails with a Filo.Error status surfaces that status (400, not 500)" do
+    opts =
+      Filo.Plug.init(
+        executor: Filo.PlugTest.FailOpen,
+        streams: @streams,
+        key: Filo.Baton.new_key(),
+        base_url: @base_url
+      )
+
+    conn = post_pipeline(opts, %{"baton" => nil, "requests" => [execute_req()]})
+
+    assert conn.status == 400, "the executor's client-error status must propagate, not become 500"
+    assert %{"code" => "FILO_NO_SHARD", "message" => "no shard specified"} = decoded(conn)
   end
 
   test "POST /v1/execute runs a single statement statelessly", %{opts: opts} do

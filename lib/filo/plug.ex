@@ -204,8 +204,8 @@ defmodule Filo.Plug do
       {:ok, stream_id, seq, pid} ->
         run(opts, stream_id, pid, seq, requests)
 
-      {:error, _reason} ->
-        {:error, 500, %Error{message: "could not open stream", code: "FILO_OPEN_FAILED"}}
+      {:error, reason} ->
+        open_failed_response(reason)
     end
   end
 
@@ -316,8 +316,8 @@ defmodule Filo.Plug do
       {:ok, stream_id, seq, pid} ->
         run_cursor(opts, stream_id, pid, seq, batch)
 
-      {:error, _reason} ->
-        {:error, 500, %Error{message: "could not open stream", code: "FILO_OPEN_FAILED"}}
+      {:error, reason} ->
+        open_failed_response(reason)
     end
   end
 
@@ -326,6 +326,17 @@ defmodule Filo.Plug do
          {:ok, pid} <- find_stream(opts.streams, stream_id) do
       run_cursor(opts, stream_id, pid, seq, batch)
     end
+  end
+
+  # A stream open that failed carrying the executor's own Filo.Error propagates that error and its
+  # HTTP status hint (a client error like a missing/invalid shard → 400, at-capacity → 503) instead
+  # of a blanket 500, so the client sees why the open was refused. Any other failure stays a 500.
+  defp open_failed_response({:open_failed, %Error{} = error}) do
+    {:error, error.status || 500, error}
+  end
+
+  defp open_failed_response(_reason) do
+    {:error, 500, %Error{message: "could not open stream", code: "FILO_OPEN_FAILED"}}
   end
 
   defp run_cursor(opts, stream_id, pid, seq, batch) do
