@@ -46,5 +46,32 @@ defmodule Filo.Executor do
   """
   @callback execute_sequence(conn(), sql :: String.t()) :: :ok | {:error, Filo.Error.t()}
 
-  @optional_callbacks describe: 2, execute_sequence: 2
+  @doc """
+  The process whose death invalidates this connection — e.g. a per-database
+  coordinator that owns the underlying file's lifecycle and whose successor may
+  flush/replace/drop that file once it believes no connections remain.
+
+  Optional. When implemented and non-nil, the stream holding the connection
+  monitors the pid and tears itself down on `:DOWN` — closing the connection via
+  `close/1` — so a connection never outlives its owner and keeps writing into a
+  file the owner's successor can pull out from under it. The client sees the
+  stream as gone (`STREAM_NOT_FOUND` on next use) and reopens, landing on the
+  successor. Return `nil` (or don't implement) when no such process exists.
+  """
+  @callback owner(conn()) :: pid() | nil
+
+  @optional_callbacks describe: 2, execute_sequence: 2, owner: 1
+
+  @doc false
+  # The owner pid to monitor for `conn`, or nil (callback not implemented, or no owner).
+  # Shared by Filo.Stream (HTTP) and Filo.Socket (WebSocket).
+  @spec owner_pid(module(), conn()) :: pid() | nil
+  def owner_pid(executor, conn) do
+    with true <- function_exported?(executor, :owner, 1),
+         pid when is_pid(pid) <- executor.owner(conn) do
+      pid
+    else
+      _ -> nil
+    end
+  end
 end

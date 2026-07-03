@@ -45,7 +45,10 @@ defmodule Filo.Socket do
     hello?: false,
     streams: %{},
     sqls: %{},
-    cursors: %{}
+    cursors: %{},
+    # Monitor ref => stream_id, for connections whose executor reports an owner
+    # process (Filo.Executor.owner/1): the owner's death tears that stream down.
+    owners: %{}
   ]
 
   @doc """
@@ -100,8 +103,24 @@ defmodule Filo.Socket do
     _ -> :error
   end
 
-  # Filo never sends itself process messages — it only replies to client frames.
+  # A connection's owner died (see Filo.Executor.owner/1): close that stream's
+  # connection now, so it never keeps writing into a file the owner's successor may
+  # flush/drop from under it. The client's next request on the stream_id gets
+  # STREAM_NOT_FOUND and reopens (landing on the successor).
   @impl true
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
+    case Map.pop(state.owners, ref) do
+      {nil, _owners} ->
+        {:ok, state}
+
+      {sid, owners} ->
+        {conn, streams} = Map.pop(state.streams, sid)
+        if conn, do: state.executor.close(conn)
+        {:ok, %{state | streams: streams, owners: owners}}
+    end
+  end
+
+  # Filo never sends itself other process messages — it only replies to client frames.
   def handle_info(_message, state), do: {:ok, state}
 
   @impl true
@@ -156,8 +175,14 @@ defmodule Filo.Socket do
     else
       case state.executor.open(state.open_arg) do
         {:ok, conn} ->
+          owners =
+            case Filo.Executor.owner_pid(state.executor, conn) do
+              nil -> state.owners
+              pid -> Map.put(state.owners, Process.monitor(pid), sid)
+            end
+
           {{:ok, %{"type" => "open_stream"}},
-           %{state | streams: Map.put(state.streams, sid, conn)}}
+           %{state | streams: Map.put(state.streams, sid, conn), owners: owners}}
 
         {:error, %Error{} = error} ->
           {{:error, encode(error)}, state}
@@ -173,7 +198,9 @@ defmodule Filo.Socket do
 
       {conn, streams} ->
         state.executor.close(conn)
-        {{:ok, %{"type" => "close_stream"}}, %{state | streams: streams}}
+
+        {{:ok, %{"type" => "close_stream"}},
+         %{state | streams: streams, owners: forget(state.owners, sid)}}
     end
   end
 
@@ -250,6 +277,19 @@ defmodule Filo.Socket do
 
   defp handle_request(%{"type" => type}, state) do
     {{:error, encode(error("unsupported request: #{type}", "FILO_UNSUPPORTED"))}, state}
+  end
+
+  # Drop (and flush) the owner monitor for a stream that closed normally, so a later
+  # owner death can't fire a stale :DOWN for it.
+  defp forget(owners, sid) do
+    case Enum.find(owners, fn {_ref, s} -> s == sid end) do
+      nil ->
+        owners
+
+      {ref, _sid} ->
+        Process.demonitor(ref, [:flush])
+        Map.delete(owners, ref)
+    end
   end
 
   # Maps `Filo.Request`'s in-band stream result to a WebSocket frame outcome.

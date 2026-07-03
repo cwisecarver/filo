@@ -37,7 +37,7 @@ defmodule Filo.Stream do
   @default_idle_timeout 10_000
   @u64_mask 0xFFFFFFFFFFFFFFFF
 
-  defstruct [:executor, :conn, :seq, :idle_timeout, :timer]
+  defstruct [:executor, :conn, :seq, :idle_timeout, :timer, :owner_ref]
 
   @doc """
   Starts a stream.
@@ -101,7 +101,11 @@ defmodule Filo.Stream do
           executor: executor,
           conn: conn,
           seq: seq,
-          idle_timeout: idle_timeout
+          idle_timeout: idle_timeout,
+          # Monitor the connection's owner (see Filo.Executor.owner/1): if it dies, this
+          # stream must not keep the connection alive — the owner's successor may replace
+          # the underlying file believing no connections remain.
+          owner_ref: monitor_owner(executor, conn)
         }
 
         {:ok, arm_timer(state)}
@@ -152,6 +156,22 @@ defmodule Filo.Stream do
   @impl true
   def handle_info(:expire, state) do
     {:stop, :normal, close_conn(state)}
+  end
+
+  # The connection's owner died: close the connection and stop, so an orphaned stream
+  # never keeps writing into a file the owner's successor may flush/drop from under it.
+  # The client's next request on this baton gets STREAM_NOT_FOUND and reopens.
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{owner_ref: ref} = state) do
+    {:stop, :normal, close_conn(state)}
+  end
+
+  def handle_info({:DOWN, _ref, :process, _pid, _reason}, state), do: {:noreply, state}
+
+  defp monitor_owner(executor, conn) do
+    case Filo.Executor.owner_pid(executor, conn) do
+      nil -> nil
+      pid -> Process.monitor(pid)
+    end
   end
 
   @impl true
