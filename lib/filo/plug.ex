@@ -25,6 +25,17 @@ defmodule Filo.Plug do
     - `:open_arg` — host context for `executor.open/1`. Either a term used as-is
       or a 1-arity function of the `Plug.Conn` (e.g. to pick a database from the
       request). Default `nil`.
+    - `:authorize` — optional host auth callback, `fun(open_arg, token)` →
+      `:ok | {:error, %Filo.Error{}}`. `token` is the request's
+      `Authorization: Bearer` credential (HTTP), or — on the WebSocket binding —
+      the `jwt` the client sent in its Hrana `hello` (libSQL's `authToken`
+      travels there, not in an upgrade header), falling back to the upgrade
+      request's bearer token; `nil` when the client sent neither. Checked once
+      per stream open (HTTP pipeline/cursor without a baton, each stateless v1
+      request, the WS hello) — a baton resumes a stream that was already
+      authorized when opened. A refusal is surfaced with the error's `status`
+      (default 401), or as a fatal `hello_error` on WebSocket. Default `nil`
+      (no auth — the host trusts the network).
     - `:base_url` — value returned in each response's `base_url`. Default `nil`.
     - `:idle_timeout` — per-stream inactivity timeout in ms. Default uses
       `Filo.Stream`'s.
@@ -54,6 +65,7 @@ defmodule Filo.Plug do
       streams: Keyword.fetch!(opts, :streams),
       key: Keyword.fetch!(opts, :key),
       open_arg: Keyword.get(opts, :open_arg),
+      authorize: Keyword.get(opts, :authorize),
       base_url: Keyword.get(opts, :base_url),
       idle_timeout: Keyword.get(opts, :idle_timeout)
     }
@@ -109,7 +121,17 @@ defmodule Filo.Plug do
   # so one mount serves both the HTTP pipeline and the WebSocket binding.
   defp upgrade(conn, opts) do
     {conn, encoding} = negotiate_subprotocol(conn)
-    socket_opts = [executor: opts.executor, open_arg: open_arg(opts, conn), encoding: encoding]
+
+    socket_opts = [
+      executor: opts.executor,
+      open_arg: open_arg(opts, conn),
+      encoding: encoding,
+      # Auth on the WS binding happens at the Hrana hello (the token rides the hello's
+      # `jwt` field, which no plug can see); hand the socket the callback plus any
+      # bearer token the upgrade request did carry, as the hello-jwt fallback.
+      authorize: opts.authorize,
+      header_token: bearer_token(conn)
+    ]
 
     conn
     |> Plug.Conn.upgrade_adapter(:websocket, {Filo.Socket, socket_opts, []})
@@ -198,14 +220,20 @@ defmodule Filo.Plug do
     end
   end
 
-  # No baton: open a fresh stream, then run the pipeline against it.
+  # No baton: authorize, open a fresh stream, then run the pipeline against it. A baton
+  # request (below) skips re-auth: the baton is a signed capability minted only after an
+  # authorized open, and it names the stream it was minted for.
   defp dispatch(opts, conn, nil, requests) do
-    case Streams.create(opts.streams, new_stream_opts(opts, conn)) do
-      {:ok, stream_id, seq, pid} ->
-        run(opts, stream_id, pid, seq, requests)
+    arg = open_arg(opts, conn)
 
-      {:error, reason} ->
-        open_failed_response(reason)
+    with :ok <- authorize(opts, arg, bearer_token(conn)) do
+      case Streams.create(opts.streams, new_stream_opts(opts, arg)) do
+        {:ok, stream_id, seq, pid} ->
+          run(opts, stream_id, pid, seq, requests)
+
+        {:error, reason} ->
+          open_failed_response(reason)
+      end
     end
   end
 
@@ -312,12 +340,16 @@ defmodule Filo.Plug do
   end
 
   defp dispatch_cursor(opts, conn, nil, batch) do
-    case Streams.create(opts.streams, new_stream_opts(opts, conn)) do
-      {:ok, stream_id, seq, pid} ->
-        run_cursor(opts, stream_id, pid, seq, batch)
+    arg = open_arg(opts, conn)
 
-      {:error, reason} ->
-        open_failed_response(reason)
+    with :ok <- authorize(opts, arg, bearer_token(conn)) do
+      case Streams.create(opts.streams, new_stream_opts(opts, arg)) do
+        {:ok, stream_id, seq, pid} ->
+          run_cursor(opts, stream_id, pid, seq, batch)
+
+        {:error, reason} ->
+          open_failed_response(reason)
+      end
     end
   end
 
@@ -352,8 +384,31 @@ defmodule Filo.Plug do
       {:error, 400, %Error{message: "stream not found", code: "STREAM_NOT_FOUND"}}
   end
 
-  defp new_stream_opts(opts, conn),
-    do: [executor: opts.executor, open_arg: open_arg(opts, conn)] ++ idle_opt(opts)
+  defp new_stream_opts(opts, arg),
+    do: [executor: opts.executor, open_arg: arg] ++ idle_opt(opts)
+
+  # No `:authorize` configured ⇒ every request is accepted (the host trusts the network).
+  # A refusal propagates the host error's HTTP status hint, defaulting to 401.
+  defp authorize(%{authorize: nil}, _arg, _token), do: :ok
+
+  defp authorize(%{authorize: fun}, arg, token) when is_function(fun, 2) do
+    case fun.(arg, token) do
+      :ok -> :ok
+      {:error, %Error{} = error} -> {:error, error.status || 401, error}
+    end
+  end
+
+  # The `Authorization: Bearer <token>` credential, or nil when absent/not-bearer.
+  # Scheme match is case-insensitive per RFC 7235.
+  defp bearer_token(conn) do
+    with [value | _] <- get_req_header(conn, "authorization"),
+         [scheme, token] <- String.split(value, " ", parts: 2),
+         "bearer" <- String.downcase(scheme) do
+      String.trim(token)
+    else
+      _ -> nil
+    end
+  end
 
   # --- Hrana 1 legacy HTTP API: stateless, one fresh connection per request ---
 
@@ -420,23 +475,34 @@ defmodule Filo.Plug do
     end
   end
 
-  # Opens a fresh connection, runs `fun`, and always closes it.
+  # Authorizes (each v1 request is stateless — every one opens fresh), opens a
+  # connection, runs `fun`, and always closes it.
   defp with_conn(opts, conn, fun) do
-    case opts.executor.open(open_arg(opts, conn)) do
-      {:ok, db} ->
-        try do
-          fun.(db)
-        after
-          opts.executor.close(db)
+    arg = open_arg(opts, conn)
+
+    case authorize(opts, arg, bearer_token(conn)) do
+      :ok ->
+        case opts.executor.open(arg) do
+          {:ok, db} ->
+            try do
+              fun.(db)
+            after
+              opts.executor.close(db)
+            end
+
+          {:error, %Error{} = error} ->
+            {:error, error}
         end
 
-      {:error, %Error{} = error} ->
+      {:error, _status, %Error{} = error} ->
         {:error, error}
     end
   end
 
   defp respond_v1(conn, {:ok, body}), do: send_json(conn, 200, body)
-  defp respond_v1(conn, {:error, %Error{} = error}), do: send_json(conn, 400, Error.encode(error))
+
+  defp respond_v1(conn, {:error, %Error{} = error}),
+    do: send_json(conn, error.status || 400, Error.encode(error))
 
   defp decode_baton(baton, key) do
     case Baton.decode(baton, key) do

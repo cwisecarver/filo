@@ -39,6 +39,8 @@ defmodule Filo.Socket do
   defstruct [
     :executor,
     :open_arg,
+    :authorize,
+    :header_token,
     encoding: :json,
     hello?: false,
     streams: %{},
@@ -50,14 +52,20 @@ defmodule Filo.Socket do
   Initializes a connection's handler state.
 
   Options: `:executor` (required, the `Filo.Executor` module), `:open_arg`
-  (host context passed to `executor.open/1` for each stream), and `:encoding`
-  (`:json` (default) or `:protobuf`, set from the negotiated subprotocol).
+  (host context passed to `executor.open/1` for each stream), `:encoding`
+  (`:json` (default) or `:protobuf`, set from the negotiated subprotocol),
+  `:authorize` (optional 2-arity host callback `fun(open_arg, token)` — see
+  `Filo.Plug`; checked at the `hello` handshake against the hello's `jwt`
+  field), and `:header_token` (a bearer token the host extracted from the
+  upgrade request, the fallback when the hello carries no `jwt`).
   """
   @impl true
   def init(opts) do
     state = %__MODULE__{
       executor: Keyword.fetch!(opts, :executor),
       open_arg: Keyword.get(opts, :open_arg),
+      authorize: Keyword.get(opts, :authorize),
+      header_token: Keyword.get(opts, :header_token),
       encoding: Keyword.get(opts, :encoding, :json)
     }
 
@@ -102,8 +110,21 @@ defmodule Filo.Socket do
     :ok
   end
 
-  defp handle_message(%{"type" => "hello"}, %{hello?: false} = state) do
-    push(%{"type" => "hello_ok"}, %{state | hello?: true})
+  # The hello handshake is where Hrana-over-WebSocket authenticates: the client's token
+  # arrives as the hello's `jwt` field (libSQL clients put `authToken` there, NOT in an
+  # upgrade header — so a plug in front of the upgrade never sees it). Fall back to the
+  # upgrade request's bearer token for clients that do send a header. A refused hello
+  # gets the spec's fatal `hello_error`, pushed before the close frame (1008, policy
+  # violation), so no stream can ever open on an unauthorized socket.
+  defp handle_message(%{"type" => "hello"} = msg, %{hello?: false} = state) do
+    case authorize(state, Map.get(msg, "jwt") || state.header_token) do
+      :ok ->
+        push(%{"type" => "hello_ok"}, %{state | hello?: true})
+
+      {:error, %Error{} = error} ->
+        hello_error = %{"type" => "hello_error", "error" => encode(error)}
+        {:stop, :normal, {1008, error.message}, [frame(hello_error, state)], state}
+    end
   end
 
   defp handle_message(%{"type" => "hello"}, state) do
@@ -268,11 +289,18 @@ defmodule Filo.Socket do
 
   defp resolve_stmt(stmt, _sqls), do: stmt
 
-  defp push(message, %{encoding: :protobuf} = state) do
-    {:push, {:binary, IO.iodata_to_binary(Filo.Protobuf.Ws.encode_server_msg(message))}, state}
-  end
+  # No host callback configured ⇒ every hello is accepted (the pre-auth behavior).
+  defp authorize(%{authorize: nil}, _token), do: :ok
 
-  defp push(message, state), do: {:push, {:text, Jason.encode!(message)}, state}
+  defp authorize(%{authorize: fun, open_arg: arg}, token) when is_function(fun, 2),
+    do: fun.(arg, token)
+
+  defp push(message, state), do: {:push, frame(message, state), state}
+
+  defp frame(message, %{encoding: :protobuf}),
+    do: {:binary, IO.iodata_to_binary(Filo.Protobuf.Ws.encode_server_msg(message))}
+
+  defp frame(message, _state), do: {:text, Jason.encode!(message)}
 
   defp error(message, code \\ "FILO_PROTO_ERROR"), do: %Error{message: message, code: code}
   defp encode(%Error{} = error), do: Error.encode(error)
