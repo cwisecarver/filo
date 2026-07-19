@@ -26,14 +26,17 @@ defmodule Filo.Plug do
       or a 1-arity function of the `Plug.Conn` (e.g. to pick a database from the
       request). Default `nil`.
     - `:authorize` — optional host auth callback, `fun(open_arg, token)` →
-      `:ok | {:error, %Filo.Error{}}`. `token` is the request's
+      `:ok | {:ok, context} | {:error, %Filo.Error{}}`. `token` is the request's
       `Authorization: Bearer` credential (HTTP), or — on the WebSocket binding —
       the `jwt` the client sent in its Hrana `hello` (libSQL's `authToken`
       travels there, not in an upgrade header), falling back to the upgrade
       request's bearer token; `nil` when the client sent neither. Checked once
       per stream open (HTTP pipeline/cursor without a baton, each stateless v1
       request, the WS hello) — a baton resumes a stream that was already
-      authorized when opened. A refusal is surfaced with the error's `status`
+      authorized when opened. Returning `{:ok, context}` threads `context`
+      (any host-opaque term — the verified scope, a tenant id) to
+      `executor.open/2` for every stream this connection opens; a bare `:ok`
+      threads `nil`. A refusal is surfaced with the error's `status`
       (default 401), or as a fatal `hello_error` on WebSocket. Default `nil`
       (no auth — the host trusts the network).
     - `:base_url` — value returned in each response's `base_url`. Default `nil`.
@@ -226,8 +229,8 @@ defmodule Filo.Plug do
   defp dispatch(opts, conn, nil, requests) do
     arg = open_arg(opts, conn)
 
-    with :ok <- authorize(opts, arg, bearer_token(conn)) do
-      case Streams.create(opts.streams, new_stream_opts(opts, arg)) do
+    with {:ok, context} <- authorize(opts, arg, bearer_token(conn)) do
+      case Streams.create(opts.streams, new_stream_opts(opts, arg, context)) do
         {:ok, stream_id, seq, pid} ->
           run(opts, stream_id, pid, seq, requests)
 
@@ -342,8 +345,8 @@ defmodule Filo.Plug do
   defp dispatch_cursor(opts, conn, nil, batch) do
     arg = open_arg(opts, conn)
 
-    with :ok <- authorize(opts, arg, bearer_token(conn)) do
-      case Streams.create(opts.streams, new_stream_opts(opts, arg)) do
+    with {:ok, context} <- authorize(opts, arg, bearer_token(conn)) do
+      case Streams.create(opts.streams, new_stream_opts(opts, arg, context)) do
         {:ok, stream_id, seq, pid} ->
           run_cursor(opts, stream_id, pid, seq, batch)
 
@@ -384,16 +387,19 @@ defmodule Filo.Plug do
       {:error, 400, %Error{message: "stream not found", code: "STREAM_NOT_FOUND"}}
   end
 
-  defp new_stream_opts(opts, arg),
-    do: [executor: opts.executor, open_arg: arg] ++ idle_opt(opts)
+  defp new_stream_opts(opts, arg, context),
+    do: [executor: opts.executor, open_arg: arg, open_context: context] ++ idle_opt(opts)
 
-  # No `:authorize` configured ⇒ every request is accepted (the host trusts the network).
-  # A refusal propagates the host error's HTTP status hint, defaulting to 401.
-  defp authorize(%{authorize: nil}, _arg, _token), do: :ok
+  # No `:authorize` configured ⇒ every request is accepted (the host trusts the network),
+  # with a nil open context. A host callback may return `{:ok, context}` to thread a verified
+  # per-connection term to `executor.open/2`; a bare `:ok` threads `nil`. A refusal propagates
+  # the host error's HTTP status hint, defaulting to 401.
+  defp authorize(%{authorize: nil}, _arg, _token), do: {:ok, nil}
 
   defp authorize(%{authorize: fun}, arg, token) when is_function(fun, 2) do
     case fun.(arg, token) do
-      :ok -> :ok
+      :ok -> {:ok, nil}
+      {:ok, context} -> {:ok, context}
       {:error, %Error{} = error} -> {:error, error.status || 401, error}
     end
   end
@@ -481,8 +487,8 @@ defmodule Filo.Plug do
     arg = open_arg(opts, conn)
 
     case authorize(opts, arg, bearer_token(conn)) do
-      :ok ->
-        case opts.executor.open(arg) do
+      {:ok, context} ->
+        case Filo.Executor.open(opts.executor, arg, context) do
           {:ok, db} ->
             try do
               fun.(db)

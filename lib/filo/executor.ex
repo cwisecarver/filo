@@ -4,9 +4,10 @@ defmodule Filo.Executor do
   database connection.
 
   Filo owns the *protocol*; the executor owns *SQL*. A stream opens one
-  connection (`open/1`), runs statements on it (`execute/2`), reports its
-  autocommit state (`autocommit?/1`), and releases it when the stream closes
-  (`close/1`). The connection handle is opaque to Filo.
+  connection (`open/1`, or `open/2` to receive the `:authorize` context),
+  runs statements on it (`execute/2`), reports its autocommit state
+  (`autocommit?/1`), and releases it when the stream closes (`close/1`). The
+  connection handle is opaque to Filo.
   """
 
   @typedoc "An opaque connection handle the host returns from `open/1`."
@@ -17,6 +18,24 @@ defmodule Filo.Executor do
   example the database name extracted from the request).
   """
   @callback open(arg :: term()) :: {:ok, conn()} | {:error, Filo.Error.t()}
+
+  @doc """
+  Opens a connection for a new stream, given the host `context` that the
+  `:authorize` callback returned for this connection (see `Filo.Plug`).
+
+  This is how a verified per-connection credential — the token's scope, a tenant
+  id, anything `authorize` decoded — reaches `open` without a process-local
+  side-channel: `authorize` returns `{:ok, context}` and Filo threads that
+  `context` here, on **both** transports (the HTTP stream that opens in its own
+  process, and every WebSocket `open_stream` after the `hello`). `context` is
+  `nil` when no `:authorize` callback is configured or it returned a bare `:ok`.
+
+  Optional. When implemented, Filo calls it in preference to `open/1`; an
+  executor that only defines `open/1` keeps working unchanged (the context is
+  simply dropped).
+  """
+  @callback open(arg :: term(), context :: term()) ::
+              {:ok, conn()} | {:error, Filo.Error.t()}
 
   @doc "Runs one statement on the connection."
   @callback execute(conn(), Filo.Stmt.t()) ::
@@ -60,7 +79,22 @@ defmodule Filo.Executor do
   """
   @callback owner(conn()) :: pid() | nil
 
-  @optional_callbacks describe: 2, execute_sequence: 2, owner: 1
+  @optional_callbacks describe: 2, execute_sequence: 2, owner: 1, open: 2
+
+  @doc false
+  # Opens a connection for a new stream, threading the authorize `context`.
+  # Prefers the context-aware `open/2`; falls back to `open/1` for executors that
+  # don't implement it (the context is dropped). Shared by Filo.Stream (HTTP),
+  # Filo.Plug (the stateless v1 path), and Filo.Socket (WebSocket), so all three
+  # transports thread the context identically.
+  @spec open(module(), term(), term()) :: {:ok, conn()} | {:error, Filo.Error.t()}
+  def open(executor, arg, context) do
+    if function_exported?(executor, :open, 2) do
+      executor.open(arg, context)
+    else
+      executor.open(arg)
+    end
+  end
 
   @doc false
   # The owner pid to monitor for `conn`, or nil (callback not implemented, or no owner).

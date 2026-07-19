@@ -45,7 +45,9 @@ defmodule Filo.Stream do
   Options:
 
     - `:executor` (required) — the `Filo.Executor` module.
-    - `:open_arg` — host context passed to `executor.open/1` (default `nil`).
+    - `:open_arg` — host context passed to `executor.open` (default `nil`).
+    - `:open_context` — the `:authorize` context threaded to `executor.open/2`
+      (default `nil`). See `Filo.Executor.open/2`.
     - `:seq` (required) — the initial sequence number.
     - `:idle_timeout` — inactivity timeout in ms (default `#{@default_idle_timeout}`).
     - `:name` — a standard `GenServer` name (e.g. a `Registry` via-tuple).
@@ -93,9 +95,10 @@ defmodule Filo.Stream do
     executor = Keyword.fetch!(opts, :executor)
     seq = Keyword.fetch!(opts, :seq)
     open_arg = Keyword.get(opts, :open_arg)
+    open_context = Keyword.get(opts, :open_context)
     idle_timeout = Keyword.get(opts, :idle_timeout, @default_idle_timeout)
 
-    case executor.open(open_arg) do
+    case Filo.Executor.open(executor, open_arg, open_context) do
       {:ok, conn} ->
         state = %__MODULE__{
           executor: executor,

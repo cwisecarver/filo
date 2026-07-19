@@ -41,6 +41,10 @@ defmodule Filo.Socket do
     :open_arg,
     :authorize,
     :header_token,
+    # The `:authorize` context captured at the `hello` handshake (see Filo.Executor.open/2).
+    # Held for the life of the connection and threaded to EVERY stream's open — so a per-connection
+    # credential (e.g. a read-only scope) applies to the 2nd stream, not just the first.
+    :open_context,
     encoding: :json,
     hello?: false,
     streams: %{},
@@ -137,8 +141,11 @@ defmodule Filo.Socket do
   # violation), so no stream can ever open on an unauthorized socket.
   defp handle_message(%{"type" => "hello"} = msg, %{hello?: false} = state) do
     case authorize(state, Map.get(msg, "jwt") || state.header_token) do
-      :ok ->
-        push(%{"type" => "hello_ok"}, %{state | hello?: true})
+      {:ok, context} ->
+        # Capture the verified context once, at hello, and hold it for the whole connection —
+        # every later open_stream threads it, so a per-connection scope can't be escalated away
+        # after the first stream.
+        push(%{"type" => "hello_ok"}, %{state | hello?: true, open_context: context})
 
       {:error, %Error{} = error} ->
         hello_error = %{"type" => "hello_error", "error" => encode(error)}
@@ -173,7 +180,7 @@ defmodule Filo.Socket do
     if Map.has_key?(state.streams, sid) do
       {{:error, encode(error("stream #{sid} already exists", "STREAM_EXISTS"))}, state}
     else
-      case state.executor.open(state.open_arg) do
+      case Filo.Executor.open(state.executor, state.open_arg, state.open_context) do
         {:ok, conn} ->
           owners =
             case Filo.Executor.owner_pid(state.executor, conn) do
@@ -329,11 +336,18 @@ defmodule Filo.Socket do
 
   defp resolve_stmt(stmt, _sqls), do: stmt
 
-  # No host callback configured ⇒ every hello is accepted (the pre-auth behavior).
-  defp authorize(%{authorize: nil}, _token), do: :ok
+  # No host callback configured ⇒ every hello is accepted (the pre-auth behavior), with a nil
+  # open context. A host callback may return `{:ok, context}` to thread a verified per-connection
+  # term (e.g. the token's scope) to `executor.open/2`; a bare `:ok` threads `nil`.
+  defp authorize(%{authorize: nil}, _token), do: {:ok, nil}
 
-  defp authorize(%{authorize: fun, open_arg: arg}, token) when is_function(fun, 2),
-    do: fun.(arg, token)
+  defp authorize(%{authorize: fun, open_arg: arg}, token) when is_function(fun, 2) do
+    case fun.(arg, token) do
+      :ok -> {:ok, nil}
+      {:ok, context} -> {:ok, context}
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  end
 
   defp push(message, state), do: {:push, frame(message, state), state}
 
