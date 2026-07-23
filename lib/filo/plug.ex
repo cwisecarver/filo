@@ -337,11 +337,37 @@ defmodule Filo.Plug do
   end
 
   # Cursor responses are newline-delimited JSON: the CursorRespBody, then entries.
+  #
+  # Entries are batched into ~@cursor_chunk_bytes iodata chunks before hitting the
+  # transport (fathom perf review 2026-07-23 #20): one `chunk/2` per ~40-byte row line
+  # meant one adapter write + HTTP/1.1 chunk framing per row - a 100k-row cursor paid
+  # 100k transport writes with framing overhead dominating payload, on the endpoint that
+  # exists specifically for large results. The wire bytes are identical (chunked
+  # framing boundaries are transport-invisible to the ndjson consumer).
+  @cursor_chunk_bytes 32 * 1024
+
   defp stream_lines(conn, items) do
-    Enum.reduce(items, conn, fn item, conn ->
-      {:ok, conn} = chunk(conn, [Jason.encode!(item), "\n"])
-      conn
-    end)
+    {conn, buf, size} =
+      Enum.reduce(items, {conn, [], 0}, fn item, {conn, buf, size} ->
+        line = [Jason.encode_to_iodata!(item), "\n"]
+        line_size = IO.iodata_length(line)
+
+        if size + line_size >= @cursor_chunk_bytes do
+          {:ok, conn} = chunk(conn, [buf, line])
+          {conn, [], 0}
+        else
+          {conn, [buf, line], size + line_size}
+        end
+      end)
+
+    case size do
+      0 ->
+        conn
+
+      _ ->
+        {:ok, conn} = chunk(conn, buf)
+        conn
+    end
   end
 
   defp dispatch_cursor(opts, conn, nil, batch, enc_opts) do
