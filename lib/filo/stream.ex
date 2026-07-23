@@ -71,11 +71,14 @@ defmodule Filo.Stream do
   continues, `next_seq` is the rotated sequence) or `:closed` (a `close` request
   released the connection, `next_seq` is `nil`). A mismatched `seq` returns
   `{:error, :baton_reused}`.
+
+  `opts` pass through to `Filo.Request.handle/4`'s result encoders (`rows: :json` for the
+  JSON transports' pre-encoded row fragments; default `:maps` for protobuf).
   """
-  @spec run(GenServer.server(), non_neg_integer(), [map()]) ::
+  @spec run(GenServer.server(), non_neg_integer(), [map()], keyword()) ::
           {:ok, Request.status(), [map()], non_neg_integer() | nil} | {:error, :baton_reused}
-  def run(server, seq, requests) do
-    GenServer.call(server, {:run, seq, requests})
+  def run(server, seq, requests, opts \\ []) do
+    GenServer.call(server, {:run, seq, requests, opts})
   end
 
   @doc """
@@ -119,12 +122,13 @@ defmodule Filo.Stream do
   end
 
   @impl true
-  def handle_call({:run, seq, _requests}, _from, %{seq: expected} = state) when seq != expected do
+  def handle_call({:run, seq, _requests, _opts}, _from, %{seq: expected} = state)
+      when seq != expected do
     {:reply, {:error, :baton_reused}, state}
   end
 
-  def handle_call({:run, _seq, requests}, _from, state) do
-    case run_pipeline(state, requests) do
+  def handle_call({:run, _seq, requests, opts}, _from, state) do
+    case run_pipeline(state, requests, opts) do
       {:open, results} ->
         # Wrap at 2^64 so the seq always fits the baton's u64 field, matching
         # libsql's wrapping_add.
@@ -183,10 +187,10 @@ defmodule Filo.Stream do
     :ok
   end
 
-  defp run_pipeline(state, requests) do
+  defp run_pipeline(state, requests, opts) do
     {status, acc} =
       Enum.reduce_while(requests, {:open, []}, fn request, {_status, acc} ->
-        {status, result} = Request.handle(state.executor, state.conn, request)
+        {status, result} = Request.handle(state.executor, state.conn, request, opts)
 
         case status do
           :open -> {:cont, {:open, [result | acc]}}

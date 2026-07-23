@@ -176,7 +176,7 @@ defmodule Filo.Plug do
         baton = Map.get(body, "baton")
         requests = Map.get(body, "requests", [])
 
-        case dispatch(opts, conn, baton, requests) do
+        case dispatch(opts, conn, baton, requests, rows: :json) do
           {:ok, new_baton, results} ->
             send_json(conn, 200, %{
               "baton" => new_baton,
@@ -202,7 +202,9 @@ defmodule Filo.Plug do
       {:ok, body, conn} ->
         decoded = Protobuf.Http.decode_pipeline_req(body)
 
-        case dispatch(opts, conn, Map.get(decoded, "baton"), Map.get(decoded, "requests", [])) do
+        case dispatch(opts, conn, Map.get(decoded, "baton"), Map.get(decoded, "requests", []),
+               rows: :maps
+             ) do
           {:ok, new_baton, results} ->
             send_protobuf(
               conn,
@@ -226,13 +228,13 @@ defmodule Filo.Plug do
   # No baton: authorize, open a fresh stream, then run the pipeline against it. A baton
   # request (below) skips re-auth: the baton is a signed capability minted only after an
   # authorized open, and it names the stream it was minted for.
-  defp dispatch(opts, conn, nil, requests) do
+  defp dispatch(opts, conn, nil, requests, enc_opts) do
     arg = open_arg(opts, conn)
 
     with {:ok, context} <- authorize(opts, arg, bearer_token(conn)) do
       case Streams.create(opts.streams, new_stream_opts(opts, arg, context)) do
         {:ok, stream_id, seq, pid} ->
-          run(opts, stream_id, pid, seq, requests)
+          run(opts, stream_id, pid, seq, requests, enc_opts)
 
         {:error, reason} ->
           open_failed_response(reason)
@@ -241,15 +243,15 @@ defmodule Filo.Plug do
   end
 
   # Baton present: resolve it to a live stream and run the pipeline.
-  defp dispatch(opts, _conn, baton, requests) when is_binary(baton) do
+  defp dispatch(opts, _conn, baton, requests, enc_opts) when is_binary(baton) do
     with {:ok, {stream_id, seq}} <- decode_baton(baton, opts.key),
          {:ok, pid} <- find_stream(opts.streams, stream_id) do
-      run(opts, stream_id, pid, seq, requests)
+      run(opts, stream_id, pid, seq, requests, enc_opts)
     end
   end
 
-  defp run(opts, stream_id, pid, seq, requests) do
-    case Stream.run(pid, seq, requests) do
+  defp run(opts, stream_id, pid, seq, requests, enc_opts) do
+    case Stream.run(pid, seq, requests, enc_opts) do
       {:ok, :open, results, next_seq} ->
         {:ok, Baton.encode(stream_id, next_seq, opts.key), results}
 
@@ -268,7 +270,7 @@ defmodule Filo.Plug do
   defp handle_cursor(conn, opts, :json) do
     case read_request(conn) do
       {:ok, %{"batch" => batch} = body, conn} ->
-        case dispatch_cursor(opts, conn, Map.get(body, "baton"), batch) do
+        case dispatch_cursor(opts, conn, Map.get(body, "baton"), batch, rows: :json) do
           {:ok, new_baton, entries} ->
             head = %{"baton" => new_baton, "base_url" => opts.base_url}
 
@@ -307,7 +309,7 @@ defmodule Filo.Plug do
             send_protobuf(conn, 400, bad_request_pb("missing batch"))
 
           batch ->
-            case dispatch_cursor(opts, conn, Map.get(decoded, "baton"), batch) do
+            case dispatch_cursor(opts, conn, Map.get(decoded, "baton"), batch, rows: :maps) do
               {:ok, new_baton, entries} ->
                 # Response is a stream of length-delimited protobufs: the
                 # CursorRespBody first, then one CursorEntry per entry.
@@ -342,13 +344,13 @@ defmodule Filo.Plug do
     end)
   end
 
-  defp dispatch_cursor(opts, conn, nil, batch) do
+  defp dispatch_cursor(opts, conn, nil, batch, enc_opts) do
     arg = open_arg(opts, conn)
 
     with {:ok, context} <- authorize(opts, arg, bearer_token(conn)) do
       case Streams.create(opts.streams, new_stream_opts(opts, arg, context)) do
         {:ok, stream_id, seq, pid} ->
-          run_cursor(opts, stream_id, pid, seq, batch)
+          run_cursor(opts, stream_id, pid, seq, batch, enc_opts)
 
         {:error, reason} ->
           open_failed_response(reason)
@@ -356,10 +358,10 @@ defmodule Filo.Plug do
     end
   end
 
-  defp dispatch_cursor(opts, _conn, baton, batch) when is_binary(baton) do
+  defp dispatch_cursor(opts, _conn, baton, batch, enc_opts) when is_binary(baton) do
     with {:ok, {stream_id, seq}} <- decode_baton(baton, opts.key),
          {:ok, pid} <- find_stream(opts.streams, stream_id) do
-      run_cursor(opts, stream_id, pid, seq, batch)
+      run_cursor(opts, stream_id, pid, seq, batch, enc_opts)
     end
   end
 
@@ -374,10 +376,10 @@ defmodule Filo.Plug do
     {:error, 500, %Error{message: "could not open stream", code: "FILO_OPEN_FAILED"}}
   end
 
-  defp run_cursor(opts, stream_id, pid, seq, batch) do
+  defp run_cursor(opts, stream_id, pid, seq, batch, enc_opts) do
     case Stream.run_cursor(pid, seq, batch) do
       {:ok, %BatchResult{} = result, next_seq} ->
-        {:ok, Baton.encode(stream_id, next_seq, opts.key), Cursor.entries(result)}
+        {:ok, Baton.encode(stream_id, next_seq, opts.key), Cursor.entries(result, enc_opts)}
 
       {:error, :baton_reused} ->
         {:error, 400, %Error{message: "baton reused", code: "BATON_REUSED"}}
@@ -560,7 +562,7 @@ defmodule Filo.Plug do
   defp send_json(conn, status, body) do
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(status, Jason.encode!(body))
+    |> send_resp(status, Jason.encode_to_iodata!(body))
   end
 
   defp send_protobuf(conn, status, body) do

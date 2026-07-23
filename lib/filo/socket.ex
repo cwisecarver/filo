@@ -246,7 +246,7 @@ defmodule Filo.Socket do
             fn -> state.executor.autocommit?(conn) end
           )
 
-        entries = Cursor.entries(result)
+        entries = Cursor.entries(result, rows_opt(state))
 
         {{:ok, %{"type" => "open_cursor"}},
          %{state | cursors: Map.put(state.cursors, cid, entries)}}
@@ -274,7 +274,7 @@ defmodule Filo.Socket do
     case Map.fetch(state.streams, sid) do
       {:ok, conn} ->
         inner = request |> Map.delete("stream_id") |> resolve_sql(state.sqls)
-        {_status, stream_result} = Request.handle(state.executor, conn, inner)
+        {_status, stream_result} = Request.handle(state.executor, conn, inner, rows_opt(state))
         {from_stream_result(stream_result), state}
 
       :error ->
@@ -354,7 +354,14 @@ defmodule Filo.Socket do
   defp frame(message, %{encoding: :protobuf}),
     do: {:binary, IO.iodata_to_binary(Filo.Protobuf.Ws.encode_server_msg(message))}
 
-  defp frame(message, _state), do: {:text, Jason.encode!(message)}
+  # WebSock frames accept iodata (its message type), so skip Jason's final
+  # IO.iodata_to_binary flatten — one less O(frame) copy per message (review #9).
+  defp frame(message, _state), do: {:text, Jason.encode_to_iodata!(message)}
+
+  # Result-encoder opts by negotiated encoding: the JSON transport takes pre-encoded row
+  # fragments; the protobuf transport traverses the :maps form.
+  defp rows_opt(%{encoding: :json}), do: [rows: :json]
+  defp rows_opt(_state), do: []
 
   defp error(message, code \\ "FILO_PROTO_ERROR"), do: %Error{message: message, code: code}
   defp encode(%Error{} = error), do: Error.encode(error)
