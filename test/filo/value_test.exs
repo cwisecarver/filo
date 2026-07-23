@@ -69,6 +69,44 @@ defmodule Filo.ValueTest do
     end
   end
 
+  describe "encode_json/1" do
+    # The direct-to-iodata encoder (the JSON transports' fast path): per cell it emits the
+    # final wire bytes instead of an intermediate tagged map that Jason re-walks. The wire
+    # form must be EXACTLY equivalent to Jason-encoding encode/1's map.
+    test "wire-equivalent to Jason.encode(encode/1) across every value shape" do
+      values = [
+        nil,
+        0,
+        42,
+        -7,
+        9_223_372_036_854_775_807,
+        -9_223_372_036_854_775_808,
+        3.14,
+        1.0,
+        -2.5e300,
+        "",
+        "hello",
+        "h\u00e9llo, \u4e16\u754c",
+        ~s(quotes " and \\ backslashes\nnewlines\ttabs),
+        <<3>>,
+        {:blob, ""},
+        {:blob, <<0, 1, 2, 255>>}
+      ]
+
+      for v <- values do
+        via_fragment = v |> Value.encode_json() |> IO.iodata_to_binary() |> Jason.decode!()
+        via_map = v |> Value.encode() |> Jason.encode!() |> Jason.decode!()
+        assert via_fragment == via_map, "wire mismatch for #{inspect(v)}"
+      end
+    end
+
+    test "a non-utf-8 binary falls back to blob, matching encode/1" do
+      bin = <<0xFF, 0xFE, "tail">>
+      decoded = bin |> Value.encode_json() |> IO.iodata_to_binary() |> Jason.decode!()
+      assert decoded == %{"type" => "blob", "base64" => Base.encode64(bin, padding: false)}
+    end
+  end
+
   describe "round-trip" do
     test "native values survive encode |> decode" do
       values = [

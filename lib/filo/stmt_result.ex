@@ -30,12 +30,21 @@ defmodule Filo.StmtResult do
             rows_read: 0,
             rows_written: 0
 
-  @doc "Encodes a `Filo.StmtResult` into a Hrana `StmtResult` map."
-  @spec encode(t()) :: map()
-  def encode(%__MODULE__{} = result) do
+  @doc """
+  Encodes a `Filo.StmtResult` into a Hrana `StmtResult` map.
+
+  With `rows: :json`, `"rows"` is a `Jason.Fragment` holding ONE pre-encoded, flattened
+  binary instead of the list-of-maps-of-tagged-maps: built where the result lives (the
+  stream/socket process), so an HTTP reply crosses the process boundary as a refc
+  binary reference instead of a deep structural copy, and the outer `Jason.encode`
+  splices it without re-walking the row data. JSON transports only — the protobuf
+  paths keep the default `:maps` form they can traverse.
+  """
+  @spec encode(t(), keyword()) :: map()
+  def encode(%__MODULE__{} = result, opts \\ []) do
     %{
       "cols" => Enum.map(result.cols, &encode_col/1),
-      "rows" => Enum.map(result.rows, fn row -> Enum.map(row, &Value.encode/1) end),
+      "rows" => encode_rows(result.rows, Keyword.get(opts, :rows, :maps)),
       "affected_row_count" => result.affected_row_count,
       "last_insert_rowid" => encode_rowid(result.last_insert_rowid),
       "replication_index" => nil,
@@ -44,6 +53,24 @@ defmodule Filo.StmtResult do
       "query_duration_ms" => 0.0
     }
   end
+
+  defp encode_rows(rows, :maps),
+    do: Enum.map(rows, fn row -> Enum.map(row, &Value.encode/1) end)
+
+  defp encode_rows(rows, :json),
+    do: Jason.Fragment.new(IO.iodata_to_binary(rows_iodata(rows)))
+
+  @doc false
+  # The rows array as final JSON iodata (see encode/2's :json mode and Filo.Cursor).
+  @spec rows_iodata([[Value.native()]]) :: iodata()
+  def rows_iodata(rows), do: json_array(rows, &row_iodata/1)
+
+  @doc false
+  @spec row_iodata([Value.native()]) :: iodata()
+  def row_iodata(row), do: json_array(row, &Value.encode_json/1)
+
+  defp json_array([], _fun), do: "[]"
+  defp json_array(items, fun), do: [?[, Enum.map_intersperse(items, ?,, fun), ?]]
 
   defp encode_col(%{name: name, decltype: decltype}),
     do: %{"name" => name, "decltype" => decltype}

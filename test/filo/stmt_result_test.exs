@@ -42,4 +42,41 @@ defmodule Filo.StmtResultTest do
     result = %StmtResult{cols: [%{name: "id", decltype: "INTEGER"}]}
     assert StmtResult.encode(result)["cols"] == [%{"name" => "id", "decltype" => "INTEGER"}]
   end
+
+  describe "encode/2 with rows: :json (the JSON transports' fast path)" do
+    # Rows become a pre-encoded Jason.Fragment holding ONE flattened binary: built where
+    # the result lives (the stream/socket process), so the HTTP reply crosses the process
+    # boundary as a refc binary instead of a deep list-of-maps-of-maps copy, and Jason
+    # never re-walks the row data. The wire JSON must be byte-for-byte-decodable to the
+    # same document the :maps form produces.
+    test "wire-equivalent to the :maps form" do
+      result = %StmtResult{
+        cols: ["id", "name", "bin"],
+        rows: [
+          [1, "alpha", {:blob, <<0, 255>>}],
+          [2, "béta", nil],
+          [3, 3.14, <<0xFF, 0xFE>>]
+        ],
+        affected_row_count: 0,
+        last_insert_rowid: nil,
+        rows_read: 3,
+        rows_written: 0
+      }
+
+      json = result |> StmtResult.encode(rows: :json) |> Jason.encode!() |> Jason.decode!()
+      maps = result |> StmtResult.encode() |> Jason.encode!() |> Jason.decode!()
+      assert json == maps
+    end
+
+    test "rows are a Jason.Fragment (pre-encoded, spliced by Jason instead of re-walked)" do
+      result = %StmtResult{cols: ["v"], rows: List.duplicate(["x"], 100), rows_read: 100}
+      assert %Jason.Fragment{} = StmtResult.encode(result, rows: :json)["rows"]
+    end
+
+    test "empty rows encode as an empty JSON array" do
+      result = %StmtResult{cols: ["v"], rows: []}
+      json = result |> StmtResult.encode(rows: :json) |> Jason.encode!() |> Jason.decode!()
+      assert json["rows"] == []
+    end
+  end
 end

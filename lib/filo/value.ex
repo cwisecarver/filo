@@ -42,6 +42,42 @@ defmodule Filo.Value do
     end
   end
 
+  @doc """
+  Encodes a native term straight to Hrana-value JSON **iodata** — the JSON transports'
+  fast path.
+
+  `encode/1`'s tagged map exists only to be consumed by a JSON encoder on those
+  transports, costing a map + key/tag binaries per cell and a second full traversal by
+  Jason; row encoding is the dominant per-request CPU of a SQL proxy, and the
+  intermediate layer roughly doubled it. This emits the final wire bytes directly —
+  five value shapes, all trivially concatenable. Floats and text delegate to
+  `Jason.encode_to_iodata!/1` so number formatting and string escaping stay
+  byte-identical to the map path (pinned by test); an invalid-UTF-8 binary falls back
+  to blob exactly as `encode/1` does, via the encoder's own rejection — which also
+  drops the `String.valid?/1` pre-scan (the map path walks every text cell twice:
+  validity here, escaping in Jason).
+
+  The protobuf transports keep consuming `encode/1`'s maps — this is JSON-only.
+  """
+  @spec encode_json(native()) :: iodata()
+  def encode_json(nil), do: ~S({"type":"null"})
+
+  def encode_json(v) when is_integer(v),
+    do: [~S({"type":"integer","value":"), Integer.to_string(v), ~S("})]
+
+  def encode_json(v) when is_float(v),
+    do: [~S({"type":"float","value":), Jason.encode_to_iodata!(v), ?}]
+
+  def encode_json({:blob, v}) when is_binary(v),
+    do: [~S({"type":"blob","base64":"), encode_base64(v), ~S("})]
+
+  def encode_json(v) when is_binary(v) do
+    [~S({"type":"text","value":), Jason.encode_to_iodata!(v), ?}]
+  rescue
+    # Not valid UTF-8 (SQLite TEXT can legally hold it) — same blob fallback as encode/1.
+    Jason.EncodeError -> [~S({"type":"blob","base64":"), encode_base64(v), ~S("})]
+  end
+
   # Hrana uses standard base64 without padding, and tolerates trailing padding
   # on input.
   defp encode_base64(bin), do: Base.encode64(bin, padding: false)

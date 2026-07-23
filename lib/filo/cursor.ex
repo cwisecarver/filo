@@ -17,16 +17,27 @@ defmodule Filo.Cursor do
 
   alias Filo.{BatchResult, Error, StmtResult, Value}
 
-  @doc "Builds the ordered list of Hrana cursor entries for a batch result."
-  @spec entries(BatchResult.t()) :: [map()]
-  def entries(%BatchResult{step_results: results, step_errors: errors}) do
+  @doc """
+  Builds the ordered list of Hrana cursor entries for a batch result.
+
+  With `rows: :json`, each `row` entry's payload is a pre-encoded `Jason.Fragment`
+  (the JSON cursor endpoint's fast path — one line per entry, so per-row tagged maps
+  plus a Jason re-walk dominated the cursor's CPU); the protobuf cursor keeps the
+  default `:maps` form it can traverse.
+  """
+  @spec entries(BatchResult.t(), keyword()) :: [map()]
+  def entries(%BatchResult{step_results: results, step_errors: errors}, opts \\ []) do
+    row_mode = Keyword.get(opts, :rows, :maps)
+
     results
     |> Enum.zip(errors)
     |> Enum.with_index()
-    |> Enum.flat_map(fn {{result, error}, step} -> step_entries(step, result, error) end)
+    |> Enum.flat_map(fn {{result, error}, step} ->
+      step_entries(step, result, error, row_mode)
+    end)
   end
 
-  defp step_entries(step, %StmtResult{} = result, _error) do
+  defp step_entries(step, %StmtResult{} = result, _error, row_mode) do
     begin = %{
       "type" => "step_begin",
       "step" => step,
@@ -34,9 +45,7 @@ defmodule Filo.Cursor do
     }
 
     rows =
-      Enum.map(result.rows, fn row ->
-        %{"type" => "row", "row" => Enum.map(row, &Value.encode/1)}
-      end)
+      Enum.map(result.rows, fn row -> %{"type" => "row", "row" => encode_row(row, row_mode)} end)
 
     step_end = %{
       "type" => "step_end",
@@ -47,12 +56,17 @@ defmodule Filo.Cursor do
     [begin | rows] ++ [step_end]
   end
 
-  defp step_entries(step, nil, %Error{} = error) do
+  defp step_entries(step, nil, %Error{} = error, _row_mode) do
     [%{"type" => "step_error", "step" => step, "error" => Error.encode(error)}]
   end
 
   # Skipped step: condition was false, neither result nor error.
-  defp step_entries(_step, nil, nil), do: []
+  defp step_entries(_step, nil, nil, _row_mode), do: []
+
+  defp encode_row(row, :maps), do: Enum.map(row, &Value.encode/1)
+
+  defp encode_row(row, :json),
+    do: Jason.Fragment.new(IO.iodata_to_binary(StmtResult.row_iodata(row)))
 
   defp encode_col(%{name: name, decltype: decltype}),
     do: %{"name" => name, "decltype" => decltype}
