@@ -149,7 +149,10 @@ defmodule Filo.Client do
   def pipeline(%__MODULE__{} = client, requests) when is_list(requests) do
     body = Jason.encode_to_iodata!(%{"baton" => client.baton, "requests" => requests})
     headers = [{"host", client.authority} | client.headers]
+    do_pipeline(client, headers, body, 1)
+  end
 
+  defp do_pipeline(client, headers, body, retries) do
     case client.transport.request(client.transport_state, "POST", client.path, headers, body) do
       {:ok, %{status: 200, body: raw}, state} ->
         doc = Jason.decode!(raw)
@@ -160,8 +163,35 @@ defmodule Filo.Client do
         client = %{client | transport_state: state}
         {:error, http_error(status, raw), client}
 
+      {:error, :closed, state} when retries > 0 ->
+        # The connection dropped — commonly a load balancer recycling an idle keep-alive after N
+        # requests, or the peer's idle close. A Hrana stream SURVIVES a connection close (that is what
+        # the baton is for), so transparently reopen the transport and retry the SAME request with the
+        # SAME baton to resume the stream — the way a real SDK (and Python's http.client `auto_open`)
+        # does, instead of surfacing an error that would make the caller abandon the stream (and any
+        # open transaction it holds). The baton's sequence number keeps this exactly-once: if the
+        # request had in fact been processed before the drop, the resend is rejected (`BATON_REUSED`),
+        # never double-applied.
+        client = %{client | transport_state: state}
+
+        case reopen(client) do
+          {:ok, client} -> do_pipeline(client, headers, body, retries - 1)
+          {:error, reason} -> {:error, {:transport, reason}, client}
+        end
+
       {:error, reason, state} ->
         {:error, {:transport, reason}, %{client | transport_state: state}}
+    end
+  end
+
+  # Reopen the transport PRESERVING the baton (to resume the stream) — the difference from the public
+  # reconnect/1, which resets the baton to start a fresh stream.
+  defp reopen(%__MODULE__{} = client) do
+    _ = client.transport.close(client.transport_state)
+
+    case client.transport.connect(client.uri, client.transport_opts) do
+      {:ok, state} -> {:ok, %{client | transport_state: state}}
+      {:error, reason} -> {:error, reason}
     end
   end
 

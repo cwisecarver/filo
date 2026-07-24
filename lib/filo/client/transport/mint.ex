@@ -43,13 +43,23 @@ defmodule Filo.Client.Transport.Mint do
       {:ok, conn, ref} ->
         case recv(conn, ref, %{status: nil, headers: [], data: []}, state.timeout) do
           {:ok, conn, response} -> {:ok, response, %{state | conn: conn}}
-          {:error, conn, reason} -> {:error, reason, %{state | conn: conn}}
+          {:error, conn, reason} -> {:error, classify(reason), %{state | conn: conn}}
         end
 
       {:error, conn, reason} ->
-        {:error, reason, %{state | conn: conn}}
+        {:error, classify(reason), %{state | conn: conn}}
     end
   end
+
+  # A dropped connection is reported as the `:closed` sentinel so `Filo.Client` can transparently
+  # reconnect + resume the stream (see its `pipeline/2`); everything else passes through verbatim.
+  # `__struct__` matches (not `%Mint.X{}`) keep this compile-safe when :mint is absent downstream.
+  defp classify(%{__struct__: Mint.TransportError, reason: reason})
+       when reason in [:closed, :econnreset, :epipe],
+       do: :closed
+
+  defp classify(%{__struct__: Mint.HTTPError, reason: :closed}), do: :closed
+  defp classify(other), do: other
 
   @impl true
   def close(%__MODULE__{conn: conn}) do

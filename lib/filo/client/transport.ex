@@ -31,6 +31,10 @@ defmodule Filo.Client.Transport do
 
   Returns the advanced state either way so a transport error still hands the client
   a connection to `close/1`.
+
+  Report a **dropped connection** (the peer or a load balancer closed the socket) as the
+  reason `:closed` — that is the sentinel `Filo.Client` treats as retryable, reconnecting and
+  resuming the stream by baton. Any other reason is returned to the caller unretried.
   """
   @callback request(
               state(),

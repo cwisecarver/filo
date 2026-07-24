@@ -1,3 +1,44 @@
+defmodule Filo.ClientTest.FlakyTransport do
+  @moduledoc false
+  # A stub `Filo.Client.Transport` that reports `:closed` for its first `fail_first` requests
+  # (tracked in an Agent passed via transport_opts), then serves a canned 200. Used to prove the
+  # client transparently reopens + resumes on a dropped connection.
+  @behaviour Filo.Client.Transport
+
+  @impl true
+  def connect(_uri, opts) do
+    agent = Keyword.fetch!(opts, :agent)
+    Agent.update(agent, &%{&1 | connects: &1.connects + 1})
+    {:ok, %{agent: agent}}
+  end
+
+  @impl true
+  def request(%{agent: agent} = state, _method, _path, _headers, _body) do
+    {n, fail_first} =
+      Agent.get_and_update(agent, fn s ->
+        {{s.requests, s.fail_first}, %{s | requests: s.requests + 1}}
+      end)
+
+    if n < fail_first do
+      {:error, :closed, state}
+    else
+      ok = %{
+        "type" => "ok",
+        "response" => %{
+          "type" => "execute",
+          "result" => %{"cols" => [], "rows" => [[%{"type" => "integer", "value" => "1"}]]}
+        }
+      }
+
+      body = Jason.encode!(%{"baton" => "resumed", "results" => [ok]})
+      {:ok, %{status: 200, headers: [], body: body}, state}
+    end
+  end
+
+  @impl true
+  def close(_state), do: :ok
+end
+
 defmodule Filo.ClientTest do
   @moduledoc """
   End-to-end test of `Filo.Client` against a real `Filo.Plug` server (Bandit +
@@ -104,6 +145,40 @@ defmodule Filo.ClientTest do
     {:ok, r, c} = Client.execute(c, "SELECT 42")
     assert r.rows == [[42]]
     Client.close(c)
+  end
+
+  test "transparently reopens + resumes the stream after a dropped connection" do
+    {:ok, agent} = start_supervised({Agent, fn -> %{connects: 0, requests: 0, fail_first: 1} end})
+
+    {:ok, c} =
+      Client.connect("http://ignored",
+        transport: Filo.ClientTest.FlakyTransport,
+        transport_opts: [agent: agent]
+      )
+
+    # The transport drops the first request; the client should reopen and resume (baton preserved),
+    # so the execute still succeeds without the caller ever seeing an error.
+    {:ok, res, _c} = Client.execute(c, "SELECT 1")
+    assert res.rows == [[1]]
+
+    # One initial connect + one reopen after the drop; two request attempts (drop, then resume).
+    assert Agent.get(agent, & &1.connects) == 2
+    assert Agent.get(agent, & &1.requests) == 2
+  end
+
+  test "surfaces {:transport, :closed} when the connection keeps dropping" do
+    {:ok, agent} =
+      start_supervised({Agent, fn -> %{connects: 0, requests: 0, fail_first: 99} end})
+
+    {:ok, c} =
+      Client.connect("http://ignored",
+        transport: Filo.ClientTest.FlakyTransport,
+        transport_opts: [agent: agent]
+      )
+
+    # Retries once (2 attempts total); both drop, so the error is surfaced rather than looping.
+    assert {:error, {:transport, :closed}, _c} = Client.execute(c, "SELECT 1")
+    assert Agent.get(agent, & &1.requests) == 2
   end
 
   defp free_port do
