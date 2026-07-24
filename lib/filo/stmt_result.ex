@@ -79,4 +79,33 @@ defmodule Filo.StmtResult do
 
   defp encode_rowid(nil), do: nil
   defp encode_rowid(id) when is_integer(id), do: Integer.to_string(id)
+
+  @doc """
+  Decodes a Hrana `StmtResult` map back into a `Filo.StmtResult` — the inverse of
+  `encode/2`, for `Filo.Client`.
+
+  Rows come back as native terms via `Filo.Value.decode/1`, `last_insert_rowid`
+  parses from its wire string, and columns keep the `%{name:, decltype:}` shape.
+  """
+  @spec decode(map()) :: t()
+  def decode(%{} = result) do
+    %__MODULE__{
+      cols: result |> Map.get("cols", []) |> Enum.map(&decode_col/1),
+      rows:
+        result |> Map.get("rows", []) |> Enum.map(fn row -> Enum.map(row, &Value.decode/1) end),
+      affected_row_count: Map.get(result, "affected_row_count", 0),
+      last_insert_rowid: decode_rowid(Map.get(result, "last_insert_rowid")),
+      rows_read: Map.get(result, "rows_read", 0),
+      rows_written: Map.get(result, "rows_written", 0)
+    }
+  end
+
+  defp decode_col(%{"name" => name, "decltype" => decltype}),
+    do: %{name: name, decltype: decltype}
+
+  defp decode_col(%{"name" => name}), do: %{name: name, decltype: nil}
+
+  defp decode_rowid(nil), do: nil
+  defp decode_rowid(id) when is_binary(id), do: String.to_integer(id)
+  defp decode_rowid(id) when is_integer(id), do: id
 end

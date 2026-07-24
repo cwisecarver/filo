@@ -41,6 +41,10 @@ defmodule Filo.MixProject do
       # The WebSock behaviour for the Hrana-over-WebSocket handler. Behaviour
       # only (like Plug) — the host brings the actual server (Bandit/Cowboy).
       {:websock, "~> 0.5"},
+      # Optional: the transport behind the default `Filo.Client.Transport.Mint`.
+      # Only needed by hosts that use the Hrana *client*; server-only hosts, and
+      # clients that bring their own `:transport`, never pull it in.
+      {:mint, "~> 1.6", optional: true},
       # Test-only: a real HTTP/WebSocket server, plus a real SQLite engine for
       # the end-to-end executor, to run libsql clients against Filo. The library
       # itself ships a Plug and a WebSock handler and never depends on either.
