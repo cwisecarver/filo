@@ -54,7 +54,13 @@ defmodule Filo.Stream do
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
-    {gen_opts, init_opts} = Keyword.split(opts, [:name])
+    # `:hibernate_after` and `:spawn_opt` pass through to GenServer (fathom expert review
+    # 2026-07-24 #22). A stream is idle-dominant by construction — a django-libsql WebSocket
+    # stream lives for hours between requests — while holding the executor handle, its statement
+    # cache, and a heap grown to the largest result set it ever materialized. With ERTS defaults
+    # that heap is never given back, which is a large part of the measured per-served-shard cost.
+    # The host decides the policy; filo just stops swallowing the options.
+    {gen_opts, init_opts} = Keyword.split(opts, [:name, :hibernate_after, :spawn_opt])
     GenServer.start_link(__MODULE__, init_opts, gen_opts)
   end
 
@@ -212,7 +218,17 @@ defmodule Filo.Stream do
   end
 
   defp arm_timer(state) do
-    if state.timer, do: Process.cancel_timer(state.timer)
+    # async: true — a synchronous Process.cancel_timer/1 SUSPENDS this process until the timer
+    # service that owns the timer replies, and send_after/3 registers the timer on whichever
+    # scheduler ran the call. A stream that has since migrated schedulers therefore pays a
+    # cross-scheduler signal round-trip on EVERY request, not merely a timer-wheel delete
+    # (fathom expert review 2026-07-24 #22).
+    #
+    # Semantics are unchanged: the cancel still happens, it is just not waited on. The only
+    # observable difference is that an already-in-flight :expire may still arrive — and
+    # handle_info(:expire, …) already handles that by stopping the stream, which is the documented
+    # re-openable contract. info: false because the cancellation result is never inspected.
+    if state.timer, do: Process.cancel_timer(state.timer, async: true, info: false)
     %{state | timer: Process.send_after(self(), :expire, state.idle_timeout)}
   end
 end

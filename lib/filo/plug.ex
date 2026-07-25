@@ -70,7 +70,11 @@ defmodule Filo.Plug do
       open_arg: Keyword.get(opts, :open_arg),
       authorize: Keyword.get(opts, :authorize),
       base_url: Keyword.get(opts, :base_url),
-      idle_timeout: Keyword.get(opts, :idle_timeout)
+      idle_timeout: Keyword.get(opts, :idle_timeout),
+      # Per-stream process policy, forwarded verbatim to Filo.Stream.start_link/1 (fathom expert
+      # review 2026-07-24 #22). A stream is idle-dominant and long-lived, so the host may want a
+      # hibernation / GC policy; filo has no opinion, it just stops dropping the options.
+      stream_spawn: Keyword.take(opts, [:hibernate_after, :spawn_opt])
     }
   end
 
@@ -416,7 +420,9 @@ defmodule Filo.Plug do
   end
 
   defp new_stream_opts(opts, arg, context),
-    do: [executor: opts.executor, open_arg: arg, open_context: context] ++ idle_opt(opts)
+    do:
+      [executor: opts.executor, open_arg: arg, open_context: context] ++
+        idle_opt(opts) ++ Map.get(opts, :stream_spawn, [])
 
   # No `:authorize` configured ⇒ every request is accepted (the host trusts the network),
   # with a nil open context. A host callback may return `{:ok, context}` to thread a verified

@@ -135,4 +135,33 @@ defmodule Filo.StreamTest do
     assert {:error, {:open_failed, %Filo.Error{code: "FILO_OPEN"}}} =
              Stream.start_link(executor: Echo, open_arg: {:fail, self()}, seq: 0)
   end
+
+  # fathom expert review 2026-07-24 #22: a stream is idle-dominant by construction (a WebSocket
+  # stream lives for hours between requests) while holding the executor handle, its statement cache,
+  # and a heap grown to the largest result set it ever materialized. start_link/1 used to swallow
+  # every option except :name, so a host could not set a GC or hibernation policy at all.
+  test "hibernate_after and spawn_opt are passed through to the GenServer" do
+    pid = start_stream(hibernate_after: 50, spawn_opt: [fullsweep_after: 0])
+
+    {:garbage_collection, gc} = Process.info(pid, :garbage_collection)
+    assert Keyword.fetch!(gc, :fullsweep_after) == 0, "spawn_opt was swallowed"
+
+    # The stream still serves normally with a hibernation policy set — hibernate preserves both
+    # the GenServer state and the process dictionary, so the connection and seq survive.
+    assert {:ok, :open, [_], 1} = Stream.run(pid, 0, [execute_req()])
+  end
+
+  test "the idle timer is re-armed per request without a synchronous cancel" do
+    pid = start_stream(idle_timeout: 60_000)
+
+    # Several requests in a row: each re-arms. The assertion is simply that the stream stays
+    # healthy and the timer keeps a fresh deadline — an async cancel must not drop or duplicate it.
+    for seq <- 0..2 do
+      assert {:ok, :open, [_], _} = Stream.run(pid, seq, [execute_req()])
+    end
+
+    timer = :sys.get_state(pid).timer
+    assert is_reference(timer)
+    assert Process.read_timer(timer) > 0, "the re-armed idle timer must carry a live deadline"
+  end
 end
