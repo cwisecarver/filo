@@ -200,6 +200,23 @@ defmodule Filo.SocketTest do
              send_msg(open_socket(), req(1, %{"type" => "open_stream", "stream_id" => 1}))
   end
 
+  # RFC 6455 §7.4.1: a text frame whose payload isn't valid UTF-8 (or otherwise isn't consistent
+  # with the message type) closes with 1007, not 1000. Bandit's `validate_text_frames` used to emit
+  # that close by pre-walking every inbound frame's bytes, immediately before Jason walks the same
+  # bytes again. A host that disables the duplicate scan lands the failure HERE instead, so this is
+  # what keeps the close code identical either way — i.e. what makes disabling it conformance-
+  # neutral rather than a silent spec deviation.
+  test "a malformed text frame closes with 1007, not a bare 1000" do
+    assert {:stop, :normal, {1007, _}, _state} =
+             Socket.handle_in({"{not json", [opcode: :text]}, open_socket())
+  end
+
+  test "an invalid-UTF-8 text frame also closes with 1007" do
+    # The exact case Bandit's pre-scan was catching: a lone continuation byte.
+    assert {:stop, :normal, {1007, _}, _state} =
+             Socket.handle_in({<<0x22, 0x80, 0x22>>, [opcode: :text]}, open_socket())
+  end
+
   test "terminate releases every open stream's connection" do
     state = open_socket() |> hello() |> open_stream(1) |> open_stream(2)
 

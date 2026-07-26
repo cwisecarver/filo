@@ -82,8 +82,22 @@ defmodule Filo.Socket do
   @impl true
   def handle_in({text, [opcode: :text]}, %{encoding: :json} = state) do
     case Jason.decode(text) do
-      {:ok, message} -> handle_message(message, state)
-      {:error, _} -> {:stop, :normal, state}
+      {:ok, message} ->
+        handle_message(message, state)
+
+      # Close 1007, not a bare 1000. RFC 6455 §5.6 requires a text frame's payload to be valid
+      # UTF-8 and §7.4.1 assigns 1007 ("data inconsistent with the type of the message") to that
+      # failure. Bandit's `validate_text_frames` produced that close itself, but it does so by
+      # walking every inbound frame's bytes — immediately before `Jason.decode/1` walks the same
+      # bytes again. A host that turns the option off to remove the duplicate scan (fathom does)
+      # would otherwise silently downgrade every malformed-frame close to 1000, because Jason's
+      # failure lands here. Emitting 1007 from the decode failure keeps the close code identical
+      # either way, so disabling the pre-scan is conformance-neutral rather than a spec deviation.
+      #
+      # Invalid UTF-8 is still rejected exactly as before — Jason cannot parse it — so this
+      # changes only which code accompanies the close.
+      {:error, _} ->
+        {:stop, :normal, {1007, "invalid frame payload data"}, state}
     end
   end
 
