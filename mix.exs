@@ -1,7 +1,7 @@
 defmodule Filo.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.2.0"
   @source_url "https://github.com/cwisecarver/filo"
 
   def project do
@@ -80,8 +80,16 @@ defmodule Filo.MixProject do
   defp docs do
     [
       main: "Filo",
+      # Must match a tag that actually exists at the documented code. v0.1.0 was
+      # tagged at the initial commit, so before v0.2.0 every source link for
+      # Filo.Client (added after that tag) pointed into a tree without it.
       source_ref: "v#{@version}",
-      extras: ["README.md"]
+      extras: ["README.md", "CHANGELOG.md", "CONTRIBUTING.md"],
+      groups_for_modules: [
+        Server: [Filo.Plug, Filo.Socket, Filo.Streams, Filo.Stream, Filo.Executor],
+        Client: [Filo.Client, Filo.Client.Transport, Filo.Client.Transport.Mint],
+        Protocol: [Filo.Value, Filo.Stmt, Filo.StmtResult, Filo.Error, Filo.Baton]
+      ]
     ]
   end
 end

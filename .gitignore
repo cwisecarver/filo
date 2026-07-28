@@ -22,3 +22,13 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 filo-*.tar
 
+
+# Python virtualenv — the integration tests drive real libSQL clients, which need a
+# Python with libsql-client. Untracked but previously unignored, so a `git add -A`
+# would have committed a virtualenv into an Elixir repo.
+.venv/
+
+# Editor/OS noise.
+.DS_Store
+.elixir_ls/
+.lexical/
