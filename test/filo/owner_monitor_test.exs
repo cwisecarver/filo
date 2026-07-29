@@ -61,8 +61,17 @@ defmodule Filo.OwnerMonitorTest do
   test "a stream tears down and closes its connection when the owner dies" do
     owner = spawn_owner()
 
+    # idle_timeout well above any plausible scheduling stall. The default is 10s, and
+    # this test asserts on the stream's EXIT REASON -- so if the suite stalls past the
+    # timeout (observed once at 23s under heavy machine load), the stream idle-expires
+    # first: it closes its connection and exits on its own, and the Process.monitor
+    # below then fires :noproc instead of :normal. That failure looks like a teardown
+    # bug and isn't one. Pinning the timeout removes the wall-clock dependency instead
+    # of loosening the assertion, which would have hidden a real early teardown.
     stream =
-      start_supervised!({Stream, executor: Echo, open_arg: {owner, self()}, seq: 0})
+      start_supervised!(
+        {Stream, executor: Echo, open_arg: {owner, self()}, seq: 0, idle_timeout: 120_000}
+      )
 
     stream_ref = Process.monitor(stream)
     Process.exit(owner, :kill)
@@ -74,7 +83,8 @@ defmodule Filo.OwnerMonitorTest do
   test "a stream whose executor has no owner is unaffected (pre-seam behavior)" do
     stream =
       start_supervised!(
-        {Stream, executor: Filo.OwnerMonitorTest.EchoNoOwner, open_arg: nil, seq: 0}
+        {Stream,
+         executor: Filo.OwnerMonitorTest.EchoNoOwner, open_arg: nil, seq: 0, idle_timeout: 120_000}
       )
 
     assert {:ok, :open, _results, 1} =
