@@ -66,14 +66,26 @@ defmodule Filo.MixProject do
   end
 
   defp description do
-    "A Hrana (libSQL) protocol server for Elixir — speak libSQL's wire " <>
+    # This is the one line people read in Hex search results, so it says what Filo IS
+    # (both halves) rather than how it is built.
+    "A Hrana (libSQL) protocol server and client for Elixir — speak libSQL's wire " <>
       "protocol from any Plug app, backed by the SQLite engine of your choice."
   end
 
   defp package do
     [
       licenses: ["MIT"],
-      links: %{"GitHub" => @source_url}
+      maintainers: ["Chris Wisecarver"],
+      # Explicit, because Hex's default list silently omitted CONTRIBUTING.md while
+      # including README/LICENSE/CHANGELOG — and docs/ lists it as an ex_doc extra, so
+      # a missing file would have broken the published docs build.
+      # Deliberately NOT shipped: AGENTS.md / CLAUDE.md (agent instructions, not user
+      # docs) and test/ (needs bandit + exqlite, which are test-only deps).
+      files: ~w(lib .formatter.exs mix.exs README.md LICENSE CHANGELOG.md CONTRIBUTING.md),
+      links: %{
+        "GitHub" => @source_url,
+        "Changelog" => "#{@source_url}/blob/main/CHANGELOG.md"
+      }
     ]
   end
 
