@@ -105,6 +105,38 @@ defmodule Filo.ValueTest do
       decoded = bin |> Value.encode_json() |> IO.iodata_to_binary() |> Jason.decode!()
       assert decoded == %{"type" => "blob", "base64" => Base.encode64(bin, padding: false)}
     end
+
+    # REGRESSION GUARD: the blob fallback must not be reached by RAISING.
+    #
+    # This branch used to classify by trying `Jason.encode_to_iodata!/1` and rescuing
+    # `Jason.EncodeError`. Every blob cell therefore built an exception (and a stacktrace):
+    # 32.8µs/value against 0.16µs for a text cell, ~200x. A SELECT returning 62,500 blob cells
+    # spent 4.4 SECONDS in this function. Nothing caught it because every workload driving this
+    # path — TPC-B, TPC-C, the wire benches — is INTEGER/REAL/TEXT and never encodes a blob.
+    #
+    # Asserted as a same-run RATIO against the text path, not an absolute duration: both halves
+    # scale together with machine speed and load, so this cannot flake on a slow or busy CI box
+    # the way a wall-clock ceiling would. Healthy is ~1.4x; the raise path is ~200x. The bar is
+    # set at 20x, far above any plausible noise and far below the regression it catches.
+    test "encoding a blob does not raise per value" do
+      n = 3_000
+      blob = :crypto.strong_rand_bytes(64)
+      text = String.duplicate("a", 64)
+
+      # Warm both paths so neither pays first-call cost inside the measurement.
+      Value.encode_json(blob)
+      Value.encode_json(text)
+
+      {blob_us, _} = :timer.tc(fn -> for _ <- 1..n, do: Value.encode_json(blob) end)
+      {text_us, _} = :timer.tc(fn -> for _ <- 1..n, do: Value.encode_json(text) end)
+
+      ratio = blob_us / max(text_us, 1)
+
+      assert ratio < 20,
+             "blob encoding is #{Float.round(ratio, 1)}x the cost of text encoding " <>
+               "(#{blob_us}µs vs #{text_us}µs for #{n} values). That is the signature of the " <>
+               "raise/rescue classifier returning — see the moduledoc. Expected ~1.4x."
+    end
   end
 
   describe "round-trip" do

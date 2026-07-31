@@ -7,6 +7,35 @@ Filo uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 version is below `1.0.0`, the **minor** number carries breaking changes as well as
 features; patch releases stay backward compatible.
 
+## [0.2.1] — 2026-07-31
+
+A performance fix on the JSON result path. Backward compatible: no API change, no
+wire-format change, identical bytes out.
+
+### Fixed
+
+- **`Filo.Value.encode_json/1` no longer raises once per BLOB cell.** The text branch
+  classified a binary by *trying* `Jason.encode_to_iodata!/1` and rescuing
+  `Jason.EncodeError` to fall back to blob. A BLOB reaches this function as a bare
+  binary — SQLite drivers hand back a plain binary for both TEXT and BLOB cells, so the
+  storage class is already gone — and random bytes are essentially never valid UTF-8, so
+  **every blob cell built an exception and a stacktrace**. Measured at 64 bytes:
+  **32.84 µs/value, against 0.16 µs for a text cell**. A result set of 62,500 blob cells
+  spent **4.4 seconds** inside this function.
+
+  Restored the `String.valid?/1` pre-scan, which costs ~0.07 µs on a text cell and saves
+  ~32.6 µs on a blob cell — break-even is around one blob per 460 text cells. End to end
+  over a real Hrana WebSocket, 64-byte blobs went from **0.9 MB/s to 32.6 MB/s (36×)**,
+  and the blob-vs-text penalty fell from **5743% to 50%**. The remainder is base64's +33%
+  bytes, which is expected and irreducible on this wire format.
+
+  It went unnoticed because every workload that drives this path — TPC-B, TPC-C, the wire
+  benches — is INTEGER, REAL and TEXT only, and never put a blob on the wire.
+  `Jason.encode_to_iodata/2` (non-bang) was measured as an alternative and rejected: it
+  still builds the error struct, at 22.5 µs/value. Guarded by a test asserting the
+  blob/text cost *ratio* rather than a wall-clock duration, so it cannot flake on a slow
+  or loaded CI box.
+
 ## [0.2.0] — 2026-07-28
 
 Filo stops being server-only: it now ships a Hrana **client** built on the same
