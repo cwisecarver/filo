@@ -35,6 +35,12 @@ defmodule Filo.SocketTest do
     state
   end
 
+  # A socket with small per-connection resource caps, so the DoS-cap tests are fast (#23).
+  defp capped_socket(opts) do
+    {:ok, state} = Socket.init([executor: Echo, open_arg: self()] ++ opts)
+    state
+  end
+
   defp send_msg(state, msg), do: Socket.handle_in({Jason.encode!(msg), [opcode: :text]}, state)
   defp pushed({:push, {:text, json}, state}), do: {Jason.decode!(json), state}
   defp req(id, request), do: %{"type" => "request", "request_id" => id, "request" => request}
@@ -174,6 +180,74 @@ defmodule Filo.SocketTest do
     {resp, _state} = pushed(send_msg(state, req(1, open)))
     assert resp["type"] == "response_error"
     assert resp["error"]["code"] == "STREAM_NOT_FOUND"
+  end
+
+  # Expert review 2026-09-05 #23: per-connection resource caps against an unbounded-growth DoS.
+  test "store_sql past :max_sqls is refused with SQL_LIMIT" do
+    state = capped_socket(max_sqls: 2) |> hello() |> open_stream(1)
+
+    # store two (the cap), each accepted, keeping the accumulated state
+    state =
+      Enum.reduce(1..2, state, fn id, st ->
+        {ok, st} =
+          pushed(
+            send_msg(
+              st,
+              req(id, %{"type" => "store_sql", "sql_id" => id, "sql" => "SELECT #{id}"})
+            )
+          )
+
+        assert ok["response"] == %{"type" => "store_sql"}
+        st
+      end)
+
+    {resp, _} =
+      pushed(
+        send_msg(state, req(3, %{"type" => "store_sql", "sql_id" => 3, "sql" => "SELECT 3"}))
+      )
+
+    assert resp["type"] == "response_error"
+    assert resp["error"]["code"] == "SQL_LIMIT"
+  end
+
+  test "store_sql past :max_sql_bytes is refused with SQL_LIMIT" do
+    state = capped_socket(max_sql_bytes: 10) |> hello() |> open_stream(1)
+
+    {ok, state} =
+      pushed(
+        send_msg(state, req(1, %{"type" => "store_sql", "sql_id" => 1, "sql" => "SELECT 1"}))
+      )
+
+    assert ok["response"] == %{"type" => "store_sql"}
+
+    # 8 stored + 9 more > 10 → refused on total bytes, not count
+    {resp, _} =
+      pushed(
+        send_msg(state, req(2, %{"type" => "store_sql", "sql_id" => 2, "sql" => "SELECT 22"}))
+      )
+
+    assert resp["type"] == "response_error"
+    assert resp["error"]["code"] == "SQL_LIMIT"
+  end
+
+  test "open_cursor past :max_cursors is refused with CURSOR_LIMIT" do
+    state = capped_socket(max_cursors: 1) |> hello() |> open_stream(1)
+
+    open = fn cid ->
+      %{
+        "type" => "open_cursor",
+        "stream_id" => 1,
+        "cursor_id" => cid,
+        "batch" => %{"steps" => [%{"stmt" => %{"sql" => "SELECT 1"}}]}
+      }
+    end
+
+    {o1, state} = pushed(send_msg(state, req(2, open.(1))))
+    assert o1["response"] == %{"type" => "open_cursor"}
+
+    {resp, _} = pushed(send_msg(state, req(3, open.(2))))
+    assert resp["type"] == "response_error"
+    assert resp["error"]["code"] == "CURSOR_LIMIT"
   end
 
   test "fetch_cursor on an unknown cursor is a response_error" do

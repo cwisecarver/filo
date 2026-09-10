@@ -36,6 +36,15 @@ defmodule Filo.Socket do
 
   alias Filo.{Batch, Cursor, Error, Request}
 
+  # Per-connection resource caps (defence against an unbounded-growth DoS: a single socket that keeps
+  # `store_sql`-ing distinct ids, or opening cursors without closing them, grows the handler's state
+  # without limit). Deliberately GENEROUS — no legitimate client stores hundreds of distinct prepared
+  # statements or opens dozens of concurrent cursors on ONE connection — so they bound abuse without
+  # tripping any real workload. Each is overridable via `init/1` opts for a host with unusual needs.
+  @default_max_sqls 512
+  @default_max_sql_bytes 16_000_000
+  @default_max_cursors 128
+
   defstruct [
     :executor,
     :open_arg,
@@ -52,7 +61,11 @@ defmodule Filo.Socket do
     cursors: %{},
     # Monitor ref => stream_id, for connections whose executor reports an owner
     # process (Filo.Executor.owner/1): the owner's death tears that stream down.
-    owners: %{}
+    owners: %{},
+    # Per-connection resource caps (see the @default_* attributes above).
+    max_sqls: @default_max_sqls,
+    max_sql_bytes: @default_max_sql_bytes,
+    max_cursors: @default_max_cursors
   ]
 
   @doc """
@@ -65,6 +78,12 @@ defmodule Filo.Socket do
   `Filo.Plug`; checked at the `hello` handshake against the hello's `jwt`
   field), and `:header_token` (a bearer token the host extracted from the
   upgrade request, the fallback when the hello carries no `jwt`).
+
+  Per-connection resource caps (all optional, generous defaults; override only for
+  unusual workloads): `:max_sqls` (stored-statement count, default #{@default_max_sqls}),
+  `:max_sql_bytes` (total stored-SQL bytes, default #{@default_max_sql_bytes}), and
+  `:max_cursors` (concurrently open cursors, default #{@default_max_cursors}). Past a cap the
+  offending `store_sql`/`open_cursor` is refused with a `SQL_LIMIT`/`CURSOR_LIMIT` error.
   """
   @impl true
   def init(opts) do
@@ -73,7 +92,10 @@ defmodule Filo.Socket do
       open_arg: Keyword.get(opts, :open_arg),
       authorize: Keyword.get(opts, :authorize),
       header_token: Keyword.get(opts, :header_token),
-      encoding: Keyword.get(opts, :encoding, :json)
+      encoding: Keyword.get(opts, :encoding, :json),
+      max_sqls: Keyword.get(opts, :max_sqls, @default_max_sqls),
+      max_sql_bytes: Keyword.get(opts, :max_sql_bytes, @default_max_sql_bytes),
+      max_cursors: Keyword.get(opts, :max_cursors, @default_max_cursors)
     }
 
     {:ok, state}
@@ -226,10 +248,31 @@ defmodule Filo.Socket do
   end
 
   defp handle_request(%{"type" => "store_sql", "sql_id" => sql_id, "sql" => sql}, state) do
-    if Map.has_key?(state.sqls, sql_id) do
-      {{:error, encode(error("sql_id #{sql_id} is already stored", "SQL_EXISTS"))}, state}
-    else
-      {{:ok, %{"type" => "store_sql"}}, %{state | sqls: Map.put(state.sqls, sql_id, sql)}}
+    cond do
+      Map.has_key?(state.sqls, sql_id) ->
+        {{:error, encode(error("sql_id #{sql_id} is already stored", "SQL_EXISTS"))}, state}
+
+      # Cap the COUNT of stored statements (expert review 2026-09-05 #23). Unbounded `store_sql` on a
+      # single socket is a memory-growth DoS; a real client caches a handful of prepared statements.
+      map_size(state.sqls) >= state.max_sqls ->
+        {{:error,
+          encode(
+            error("too many stored SQLs on this connection (max #{state.max_sqls})", "SQL_LIMIT")
+          )}, state}
+
+      # Cap the total BYTES too: the count cap alone still admits `max_sqls` huge statements. Summed
+      # lazily over the (already count-bounded) map, so this is O(max_sqls) on a cold `store_sql`.
+      stored_sql_bytes(state.sqls) + byte_size(sql) > state.max_sql_bytes ->
+        {{:error,
+          encode(
+            error(
+              "stored SQL byte budget exceeded on this connection (max #{state.max_sql_bytes})",
+              "SQL_LIMIT"
+            )
+          )}, state}
+
+      true ->
+        {{:ok, %{"type" => "store_sql"}}, %{state | sqls: Map.put(state.sqls, sql_id, sql)}}
     end
   end
 
@@ -244,6 +287,19 @@ defmodule Filo.Socket do
     cond do
       Map.has_key?(state.cursors, cid) ->
         {{:error, encode(error("cursor #{cid} already open", "CURSOR_EXISTS"))}, state}
+
+      # Cap the number of concurrently OPEN cursors per connection (expert review 2026-09-05 #23).
+      # A cursor holds its batch's materialized entries in state until `close_cursor`/`fetch_cursor`
+      # drains it, so opening cursors without closing them grows memory without bound. Checked before
+      # STREAM_NOT_FOUND so a client cannot probe stream existence past the cap.
+      map_size(state.cursors) >= state.max_cursors ->
+        {{:error,
+          encode(
+            error(
+              "too many open cursors on this connection (max #{state.max_cursors})",
+              "CURSOR_LIMIT"
+            )
+          )}, state}
 
       not Map.has_key?(state.streams, sid) ->
         {{:error, encode(error("stream #{sid} not found", "STREAM_NOT_FOUND"))}, state}
@@ -376,6 +432,9 @@ defmodule Filo.Socket do
   # fragments; the protobuf transport traverses the :maps form.
   defp rows_opt(%{encoding: :json}), do: [rows: :json]
   defp rows_opt(_state), do: []
+
+  defp stored_sql_bytes(sqls),
+    do: Enum.reduce(sqls, 0, fn {_id, sql}, acc -> acc + byte_size(sql) end)
 
   defp error(message, code \\ "FILO_PROTO_ERROR"), do: %Error{message: message, code: code}
   defp encode(%Error{} = error), do: Error.encode(error)
