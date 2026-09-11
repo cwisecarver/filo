@@ -7,6 +7,30 @@ Filo uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 version is below `1.0.0`, the **minor** number carries breaking changes as well as
 features; patch releases stay backward compatible.
 
+## [0.3.0] — 2026-09-10
+
+Per-connection resource caps on the WebSocket handler, defending against an
+unbounded-growth memory DoS. Minor (not patch) because a client that abused the
+previously-unbounded `store_sql`/`open_cursor` now gets refused — though the
+defaults are generous enough that no legitimate client is affected.
+
+### Added
+
+- **`Filo.Socket` caps per-connection stored SQL and open cursors.** A single
+  socket could grow handler state without bound: `store_sql` with ever-new
+  `sql_id`s accumulates cached SQL text, and `open_cursor` without a matching
+  close (or fetch-to-done) accumulates materialized cursor entries. Three caps,
+  all overridable via `init/1` opts, refuse past the limit with new `SQL_LIMIT` /
+  `CURSOR_LIMIT` errors:
+  - `:max_sqls` — stored-statement count (default `512`)
+  - `:max_sql_bytes` — total stored-SQL bytes (default `16_000_000`)
+  - `:max_cursors` — concurrently open cursors (default `128`)
+
+  The defaults are deliberately generous — no real client caches hundreds of
+  distinct prepared statements or opens dozens of concurrent cursors on one
+  connection — so they bound abuse without tripping any real workload
+  (`django-libsql` included).
+
 ## [0.2.1] — 2026-07-31
 
 A performance fix on the JSON result path. Backward compatible: no API change, no
