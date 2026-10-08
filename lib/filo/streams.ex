@@ -56,12 +56,26 @@ defmodule Filo.Streams do
     registry = registry(name)
     stream_id = gen_stream_id(registry)
     seq = rand_u64()
-    opts = Keyword.merge(stream_opts, seq: seq, name: via(registry, stream_id))
 
-    case DynamicSupervisor.start_child(dynsup(name), {Filo.Stream, opts}) do
-      {:ok, pid} -> {:ok, stream_id, seq, pid}
-      {:error, reason} -> {:error, reason}
+    opts =
+      Keyword.merge(stream_opts, seq: seq, name: via(registry, stream_id), deferred_open: true)
+
+    # The executor open runs in the stream process, and THIS caller waits for it — not the shared
+    # DynamicSupervisor, which used to block every other create on the node behind one slow open
+    # (fathom expert review 2026-10-01 #2). The contract is unchanged: `create/2` returns once the
+    # connection is open, or with `{:error, {:open_failed, error}}`.
+    with {:ok, pid} <- DynamicSupervisor.start_child(dynsup(name), {Filo.Stream, opts}),
+         :ok <- await_open(pid) do
+      {:ok, stream_id, seq, pid}
     end
+  end
+
+  # An executor that raises (rather than returning an error) crashes the stream mid-open; report
+  # that as the create's error, as start_child did when the open ran in init/1.
+  defp await_open(pid) do
+    Filo.Stream.await_open(pid)
+  catch
+    :exit, {reason, _call} -> {:error, reason}
   end
 
   @doc "Finds the stream process for `stream_id`, or `:error` if there is none."

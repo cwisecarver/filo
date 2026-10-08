@@ -18,7 +18,9 @@ defmodule Filo.Stream do
   ## Lifecycle
 
   - `start_link/1` opens the connection through the executor; if the executor
-    cannot open one, the start fails with `{:open_failed, error}`.
+    cannot open one, the start fails with `{:open_failed, error}`. With
+    `deferred_open: true` the start returns at once and the open runs in the
+    stream process; the starter then waits for it with `await_open/1`.
   - A `close` request releases the connection (via `Filo.Request`) and the
     process stops normally.
   - After `:idle_timeout` of inactivity the stream expires: it closes its
@@ -37,7 +39,7 @@ defmodule Filo.Stream do
   @default_idle_timeout 10_000
   @u64_mask 0xFFFFFFFFFFFFFFFF
 
-  defstruct [:executor, :conn, :seq, :idle_timeout, :timer, :owner_ref]
+  defstruct [:executor, :conn, :seq, :idle_timeout, :timer, :owner_ref, :open_error]
 
   @doc """
   Starts a stream.
@@ -51,6 +53,9 @@ defmodule Filo.Stream do
     - `:seq` (required) — the initial sequence number.
     - `:idle_timeout` — inactivity timeout in ms (default `#{@default_idle_timeout}`).
     - `:name` — a standard `GenServer` name (e.g. a `Registry` via-tuple).
+    - `:deferred_open` — when `true`, return before the executor open and run it in the stream
+      process instead; the caller must then `await_open/1` (default `false`). `Filo.Streams`
+      uses it so a slow open never runs inside the shared `DynamicSupervisor`.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -88,6 +93,15 @@ defmodule Filo.Stream do
   end
 
   @doc """
+  Waits for a `deferred_open: true` stream's executor open. Returns `:ok` once the connection is
+  open, or `{:error, {:open_failed, error}}` (and the stream stops) if the executor refused it.
+
+  It waits as long as the open takes, as `start_link/1` would: the executor bounds its own open.
+  """
+  @spec await_open(GenServer.server()) :: :ok | {:error, {:open_failed, term()}}
+  def await_open(server), do: GenServer.call(server, :await_open, :infinity)
+
+  @doc """
   Runs a decoded Hrana batch map against the stream for a cursor, returning the
   raw `Filo.BatchResult` (which the caller streams as cursor entries) and the
   rotated sequence. Like `run/3`, a mismatched `seq` is `{:error, :baton_reused}`.
@@ -106,28 +120,56 @@ defmodule Filo.Stream do
     open_arg = Keyword.get(opts, :open_arg)
     open_context = Keyword.get(opts, :open_context)
     idle_timeout = Keyword.get(opts, :idle_timeout, @default_idle_timeout)
+    state = %__MODULE__{executor: executor, seq: seq, idle_timeout: idle_timeout}
 
-    case Filo.Executor.open(executor, open_arg, open_context) do
-      {:ok, conn} ->
-        state = %__MODULE__{
-          executor: executor,
-          conn: conn,
-          seq: seq,
-          idle_timeout: idle_timeout,
-          # Monitor the connection's owner (see Filo.Executor.owner/1): if it dies, this
-          # stream must not keep the connection alive — the owner's successor may replace
-          # the underlying file believing no connections remain.
-          owner_ref: monitor_owner(executor, conn)
-        }
-
-        {:ok, arm_timer(state)}
-
-      {:error, error} ->
-        {:stop, {:open_failed, error}}
+    if Keyword.get(opts, :deferred_open, false) do
+      # The open can take seconds (a cold shard's storage pull, a failover hold) and a
+      # DynamicSupervisor's start_child does not return until init/1 does, so opening here would
+      # make every stream start on the node wait behind the slowest open (fathom expert review
+      # 2026-10-01 #2). The continue runs before any call, so `await_open/1` sees the result.
+      {:ok, state, {:continue, {:open, open_arg, open_context}}}
+    else
+      case open_conn(state, open_arg, open_context) do
+        {:ok, state} -> {:ok, state}
+        {:error, error} -> {:stop, {:open_failed, error}}
+      end
     end
   end
 
   @impl true
+  def handle_continue({:open, open_arg, open_context}, state) do
+    case open_conn(state, open_arg, open_context) do
+      {:ok, state} ->
+        {:noreply, state}
+
+      # Kept alive to hand the error to `await_open/1`, which then stops the stream normally.
+      # The idle timer covers a starter that died before asking, so the stream cannot linger.
+      {:error, error} ->
+        {:noreply, arm_timer(%{state | open_error: error})}
+    end
+  end
+
+  defp open_conn(state, open_arg, open_context) do
+    case Filo.Executor.open(state.executor, open_arg, open_context) do
+      {:ok, conn} ->
+        # Monitor the connection's owner (see Filo.Executor.owner/1): if it dies, this
+        # stream must not keep the connection alive — the owner's successor may replace
+        # the underlying file believing no connections remain.
+        state = %{state | conn: conn, owner_ref: monitor_owner(state.executor, conn)}
+        {:ok, arm_timer(state)}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  @impl true
+  def handle_call(:await_open, _from, %{open_error: nil} = state), do: {:reply, :ok, state}
+
+  def handle_call(:await_open, _from, state) do
+    {:stop, :normal, {:error, {:open_failed, state.open_error}}, state}
+  end
+
   def handle_call({:run, seq, _requests, _opts}, _from, %{seq: expected} = state)
       when seq != expected do
     {:reply, {:error, :baton_reused}, state}

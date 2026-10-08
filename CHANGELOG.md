@@ -7,6 +7,23 @@ Filo uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 version is below `1.0.0`, the **minor** number carries breaking changes as well as
 features; patch releases stay backward compatible.
 
+## [Unreleased]
+
+### Fixed
+
+- **A slow stream open no longer blocks every other HTTP stream open.**
+  `Filo.Streams.create/2` started each stream with the executor open running
+  inside `Filo.Stream.init/1`, and `DynamicSupervisor.start_child/2` waits for
+  `init/1` — so one slow open (a cold shard pulling from storage, a failover
+  hold) serialized every baton-less HTTP request on the node behind it. The
+  open now runs in the stream process, and only the request that asked for it
+  waits. `create/2`'s contract is unchanged.
+
+### Added
+
+- `Filo.Stream.start_link/1` option `:deferred_open` and `Filo.Stream.await_open/1`.
+  The default (`false`) keeps the old synchronous open.
+
 ## [0.3.0] — 2026-09-10
 
 Per-connection resource caps on the WebSocket handler, defending against an

@@ -4,6 +4,17 @@ defmodule Filo.StreamsTest.Echo do
 
   @impl true
   def open(:fail), do: {:error, %Filo.Error{message: "no db", code: "FILO_OPEN"}}
+
+  # A slow open (a cold shard's S3 pull, a held retry): tell the test it started, then block until
+  # the test says :go, and open or fail as told.
+  def open({:gate, test, result}) do
+    send(test, {:opening, self()})
+
+    receive do
+      :go -> if result == :ok, do: {:ok, :conn}, else: open(:fail)
+    end
+  end
+
   def open(_arg), do: {:ok, :conn}
 
   @impl true
@@ -66,5 +77,49 @@ defmodule Filo.StreamsTest do
   test "create surfaces the executor error when the connection cannot open" do
     assert {:error, {:open_failed, %Filo.Error{code: "FILO_OPEN"}}} =
              Streams.create(@name, executor: Echo, open_arg: :fail)
+  end
+
+  # Fathom expert review 2026-10-01 #2. The executor open used to run inside `Filo.Stream.init/1`,
+  # and `DynamicSupervisor.start_child/2` does not return until `init/1` does — so ONE slow open (a
+  # cold shard pulling from S3, a failover held-retry sleeping for seconds) blocked every other
+  # baton-less stream open on the node behind the single supervisor. The open must happen outside
+  # the supervisor: a second create completes while the first open is still stuck.
+  test "a slow open does not block other streams from being created" do
+    test = self()
+
+    slow =
+      Task.async(fn -> Streams.create(@name, executor: Echo, open_arg: {:gate, test, :ok}) end)
+
+    assert_receive {:opening, opener}
+
+    fast = Task.async(fn -> Streams.create(@name, executor: Echo, open_arg: self()) end)
+
+    try do
+      assert {:ok, {:ok, _id, _seq, _pid}} = Task.yield(fast, 2_000),
+             "a second create waited behind the first stream's slow open"
+    after
+      # Release the slow open even on failure: pre-fix it holds the supervisor, which would then
+      # never shut down and fail every later test's setup instead of just this one.
+      send(opener, :go)
+    end
+
+    assert {:ok, _id, _seq, _pid} = Task.await(slow)
+  end
+
+  # The caller still waits for ITS OWN open, so `create/2`'s contract is unchanged: it returns only
+  # once the connection is open, and a failed open comes back as {:error, {:open_failed, _}}.
+  @tag :capture_log
+  test "a slow open that fails still surfaces the executor error, and the stream is gone" do
+    test = self()
+
+    slow =
+      Task.async(fn -> Streams.create(@name, executor: Echo, open_arg: {:gate, test, :fail}) end)
+
+    assert_receive {:opening, opener}
+    ref = Process.monitor(opener)
+    send(opener, :go)
+
+    assert {:error, {:open_failed, %Filo.Error{code: "FILO_OPEN"}}} = Task.await(slow)
+    assert_receive {:DOWN, ^ref, :process, ^opener, _}
   end
 end
