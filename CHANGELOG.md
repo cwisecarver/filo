@@ -16,7 +16,7 @@ changes, and `:deferred_open` is opt-in.
 
 - **A slow stream open no longer blocks every other HTTP stream open.**
   `Filo.Streams.create/2` started each stream with the executor open running
-  inside `Filo.Stream.init/1`, and `DynamicSupervisor.start_child/2` waits for
+  inside the stream process's `init` callback, and `DynamicSupervisor.start_child/2` waits for
   `init/1` — so one slow open (a cold shard pulling from storage, a failover
   hold) serialized every baton-less HTTP request on the node behind it. The
   open now runs in the stream process, and only the request that asked for it
