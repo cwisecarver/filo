@@ -7,7 +7,10 @@ Filo uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 version is below `1.0.0`, the **minor** number carries breaking changes as well as
 features; patch releases stay backward compatible.
 
-## [Unreleased]
+## [0.3.1] — 2026-10-08
+
+Two fixes from fathom's 2026-10-01 perf review. Patch release: no breaking
+changes, and `:deferred_open` is opt-in.
 
 ### Fixed
 
