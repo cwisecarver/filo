@@ -19,6 +19,16 @@ features; patch releases stay backward compatible.
   open now runs in the stream process, and only the request that asked for it
   waits. `create/2`'s contract is unchanged.
 
+### Changed
+
+- **Protobuf transports encode result rows straight from native values.** The
+  HTTP and WebSocket protobuf paths built every cell as a JSON-shaped tagged map
+  (integers as strings, blobs as base64), copied it from the stream process to
+  the plug, then parsed it back to write protobuf. `Filo.StmtResult.encode/2`
+  now takes `rows: :protobuf` and encodes the rows to protobuf bytes where the
+  result lives. Same bytes on the wire; measured 48–65% less encode time
+  (10 to 20k rows).
+
 ### Added
 
 - `Filo.Stream.start_link/1` option `:deferred_open` and `Filo.Stream.await_open/1`.

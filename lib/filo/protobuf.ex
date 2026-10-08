@@ -109,7 +109,7 @@ defmodule Filo.Protobuf do
   def encode_stmt_result(%{} = result) do
     [
       for(col <- Map.get(result, "cols", []), do: Wire.field_len(1, encode_col(col))),
-      for(row <- Map.get(result, "rows", []), do: Wire.field_len(2, encode_row(row))),
+      encode_rows(Map.get(result, "rows", [])),
       uint_field(3, Map.get(result, "affected_row_count", 0)),
       int_field(4, to_int_or_nil(Map.get(result, "last_insert_rowid")), :sint)
     ]
@@ -139,7 +139,35 @@ defmodule Filo.Protobuf do
     %{"name" => take_string(fields, 1, nil), "decltype" => take_string(fields, 2, nil)}
   end
 
+  # `Filo.StmtResult.encode(result, rows: :protobuf)` already encoded the rows, in the process that
+  # holds the result; splice them as they are.
+  defp encode_rows({:protobuf_rows, encoded}), do: encoded
+  defp encode_rows(rows), do: for(row <- rows, do: Wire.field_len(2, encode_row(row)))
+
   defp encode_row(values), do: for(v <- values, do: Wire.field_len(1, encode_value(v)))
+
+  @doc false
+  # The `rows` fields of a `StmtResult` message, encoded straight from native row terms — the
+  # protobuf twin of `Filo.StmtResult.rows_iodata/1`. It skips the JSON-shaped tagged map
+  # (integers as strings, blobs as base64) that `encode_value/1` would only parse back, and
+  # returns one binary, so it crosses a process boundary as a reference rather than a deep copy
+  # (fathom expert review 2026-10-01 #37). Byte-identical to the map path, `Filo.Value.encode/1`'s
+  # rules included: a binary that is not valid UTF-8 goes out as a blob.
+  @spec encode_native_rows([[Filo.Value.native()]]) :: binary()
+  def encode_native_rows(rows) do
+    IO.iodata_to_binary(for row <- rows, do: Wire.field_len(2, native_row(row)))
+  end
+
+  defp native_row(values), do: for(v <- values, do: Wire.field_len(1, native_value(v)))
+
+  defp native_value(nil), do: Wire.field_len(1, "")
+  defp native_value(v) when is_integer(v), do: Wire.field_sint64(2, v)
+  defp native_value(v) when is_float(v), do: Wire.field_double(3, v)
+  defp native_value({:blob, v}) when is_binary(v), do: Wire.field_len(5, v)
+
+  defp native_value(v) when is_binary(v) do
+    if String.valid?(v), do: Wire.field_len(4, v), else: Wire.field_len(5, v)
+  end
 
   defp decode_row(bin) do
     bin

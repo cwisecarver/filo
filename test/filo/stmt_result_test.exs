@@ -79,4 +79,48 @@ defmodule Filo.StmtResultTest do
       assert json["rows"] == []
     end
   end
+
+  # Fathom expert review 2026-10-01 #37. The protobuf transports built every cell as a tagged map
+  # with integers as strings and blobs as base64 (the JSON shape), deep-copied that structure from
+  # the stream process to the plug, then parsed the strings and base64 back to encode protobuf.
+  # `rows: :protobuf` encodes the rows straight from native terms, where the result lives. It must
+  # produce the SAME bytes as the old path for every value kind, including the edge cases.
+  describe "encode/2 with rows: :protobuf" do
+    @edge_rows [
+      [nil, 0, -1, 9_223_372_036_854_775_807, -9_223_372_036_854_775_808],
+      [1.5, -0.0, 1.0e300, "", "héllo ✓"],
+      [{:blob, <<>>}, {:blob, <<0, 255, 10>>}, <<0xFF, 0xFE>>, "plain", 42]
+    ]
+
+    test "gives byte-identical protobuf to the :maps path for every value kind" do
+      result = %StmtResult{
+        cols: ["a", %{name: "b", decltype: "INTEGER"}, "c", "d", "e"],
+        rows: @edge_rows,
+        affected_row_count: 3,
+        last_insert_rowid: -7
+      }
+
+      assert pb(StmtResult.encode(result, rows: :protobuf)) == pb(StmtResult.encode(result))
+    end
+
+    test "an empty result is byte-identical too" do
+      result = %StmtResult{cols: ["a"], rows: []}
+      assert pb(StmtResult.encode(result, rows: :protobuf)) == pb(StmtResult.encode(result))
+    end
+
+    test "batch step results take the same path" do
+      batch = %Filo.BatchResult{
+        step_results: [%StmtResult{cols: ["x"], rows: @edge_rows}, nil],
+        step_errors: [nil, %Filo.Error{message: "boom", code: "E"}]
+      }
+
+      fast = Filo.BatchResult.encode(batch, rows: :protobuf)
+      slow = Filo.BatchResult.encode(batch)
+
+      assert IO.iodata_to_binary(Filo.Protobuf.encode_batch_result(fast)) ==
+               IO.iodata_to_binary(Filo.Protobuf.encode_batch_result(slow))
+    end
+
+    defp pb(map), do: IO.iodata_to_binary(Filo.Protobuf.encode_stmt_result(map))
+  end
 end

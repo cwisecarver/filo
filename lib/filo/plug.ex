@@ -206,8 +206,11 @@ defmodule Filo.Plug do
       {:ok, body, conn} ->
         decoded = Protobuf.Http.decode_pipeline_req(body)
 
+        # rows: :protobuf — the stream process encodes rows to protobuf bytes itself, so the
+        # reply crosses to this process as one binary, not a deep copy of tagged maps
+        # (fathom expert review 2026-10-01 #37).
         case dispatch(opts, conn, Map.get(decoded, "baton"), Map.get(decoded, "requests", []),
-               rows: :maps
+               rows: :protobuf
              ) do
           {:ok, new_baton, results} ->
             send_protobuf(

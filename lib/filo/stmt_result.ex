@@ -37,8 +37,12 @@ defmodule Filo.StmtResult do
   binary instead of the list-of-maps-of-tagged-maps: built where the result lives (the
   stream/socket process), so an HTTP reply crosses the process boundary as a refc
   binary reference instead of a deep structural copy, and the outer `Jason.encode`
-  splices it without re-walking the row data. JSON transports only — the protobuf
-  paths keep the default `:maps` form they can traverse.
+  splices it without re-walking the row data. JSON transports only.
+
+  With `rows: :protobuf`, `"rows"` is `{:protobuf_rows, binary}`: the rows already
+  encoded as protobuf `StmtResult.rows` fields, for the same reason. Only
+  `Filo.Protobuf.encode_stmt_result/1` understands it. The default `:maps` gives the
+  plain Hrana JSON-term maps.
   """
   @spec encode(t(), keyword()) :: map()
   def encode(%__MODULE__{} = result, opts \\ []) do
@@ -59,6 +63,8 @@ defmodule Filo.StmtResult do
 
   defp encode_rows(rows, :json),
     do: Jason.Fragment.new(IO.iodata_to_binary(rows_iodata(rows)))
+
+  defp encode_rows(rows, :protobuf), do: {:protobuf_rows, Filo.Protobuf.encode_native_rows(rows)}
 
   @doc false
   # The rows array as final JSON iodata (see encode/2's :json mode and Filo.Cursor).

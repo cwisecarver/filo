@@ -428,10 +428,11 @@ defmodule Filo.Socket do
   # IO.iodata_to_binary flatten — one less O(frame) copy per message (review #9).
   defp frame(message, _state), do: {:text, Jason.encode_to_iodata!(message)}
 
-  # Result-encoder opts by negotiated encoding: the JSON transport takes pre-encoded row
-  # fragments; the protobuf transport traverses the :maps form.
+  # Result-encoder opts by negotiated encoding: each transport takes its rows pre-encoded, so
+  # the protobuf one no longer round-trips every cell through strings and base64 (fathom
+  # expert review 2026-10-01 #37).
   defp rows_opt(%{encoding: :json}), do: [rows: :json]
-  defp rows_opt(_state), do: []
+  defp rows_opt(%{encoding: :protobuf}), do: [rows: :protobuf]
 
   defp stored_sql_bytes(sqls),
     do: Enum.reduce(sqls, 0, fn {_id, sql}, acc -> acc + byte_size(sql) end)
