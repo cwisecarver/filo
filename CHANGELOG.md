@@ -7,6 +7,25 @@ Filo uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 version is below `1.0.0`, the **minor** number carries breaking changes as well as
 features; patch releases stay backward compatible.
 
+## [0.3.2] — 2026-10-09
+
+Two `Filo.Stream` fixes from fathom's 2026-10-08 expert review. Patch release:
+no API changes.
+
+### Fixed
+
+- **A supervisor shutdown now closes the stream's connection.** `Filo.Stream`
+  did not trap exits, so on application stop (or any supervisor shutdown) each
+  stream was killed without running `terminate/2`, and the executor's `close/1`
+  never ran. Streams now trap exits and close the connection on shutdown, still
+  exactly once. A linked process that exits abnormally still stops the stream
+  with the same reason, now closing the connection first; a normal exit is
+  ignored, as before.
+- **A stray message no longer crashes a stream.** `handle_info/2` matched only
+  the stream's own messages, so anything else (fathom saw a late watchdog
+  message) killed it with a `FunctionClauseError`. Unknown messages are now
+  ignored and logged at debug level.
+
 ## [0.3.1] — 2026-10-08
 
 Two fixes from fathom's 2026-10-01 perf review. Patch release: no breaking
