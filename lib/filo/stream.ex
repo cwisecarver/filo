@@ -236,7 +236,7 @@ defmodule Filo.Stream do
         result =
           Batch.run(
             decoded,
-            &state.executor.execute(state.conn, &1),
+            &Request.execute(state.executor, state.conn, &1),
             fn -> state.executor.autocommit?(state.conn) end
           )
 

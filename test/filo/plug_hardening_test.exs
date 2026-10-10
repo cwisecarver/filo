@@ -173,7 +173,9 @@ defmodule Filo.PlugHardeningTest do
   # Invariant: a body over the cap is a 413 with a Hrana-shaped error, before auth and the stream.
   describe "body cap" do
     test "an oversized JSON body is 413 and never reaches the executor", %{key: key} do
-      opts = plug_opts(key, max_body: 1_000, authorize: fn _arg, _token -> flunk("authorized") end)
+      opts =
+        plug_opts(key, max_body: 1_000, authorize: fn _arg, _token -> flunk("authorized") end)
+
       big = Jason.encode!(%{"requests" => [exec_req(String.duplicate("x", 5_000))]})
 
       conn = post(opts, "/v3/pipeline", big)
@@ -184,7 +186,15 @@ defmodule Filo.PlugHardeningTest do
 
     test "an oversized protobuf body is 413 too", %{key: key} do
       opts = plug_opts(key, max_body: 1_000)
-      conn = post(opts, "/v3-protobuf/pipeline", :crypto.strong_rand_bytes(5_000), "application/x-protobuf")
+
+      conn =
+        post(
+          opts,
+          "/v3-protobuf/pipeline",
+          :crypto.strong_rand_bytes(5_000),
+          "application/x-protobuf"
+        )
+
       assert conn.status == 413
     end
 
@@ -193,6 +203,37 @@ defmodule Filo.PlugHardeningTest do
       body = Jason.encode!(%{"requests" => [exec_req("SELECT 1")]})
       assert byte_size(body) < 1_000
       assert post(opts, "/v3/pipeline", body).status == 200
+    end
+  end
+
+  # H9 (fathom panel2 2026-10-10): HTTP has no stored-SQL store, so a statement carrying only a
+  # sql_id reached the executor with sql: nil. Invariant: it is refused with FILO_UNSUPPORTED before
+  # the executor, and (in a pipeline) the stream and baton survive.
+  describe "sql_id over HTTP" do
+    @by_id %{"type" => "execute", "stmt" => %{"sql_id" => 3}}
+
+    test "a pipeline execute is a per-request FILO_UNSUPPORTED error", %{key: key} do
+      opts = plug_opts(key)
+      first = post(opts, "/v3/pipeline", %{"requests" => [@by_id, exec_req("SELECT 1")]})
+      assert first.status == 200
+      [bad, good] = decoded(first)["results"]
+      assert bad["error"]["code"] == "FILO_UNSUPPORTED"
+      assert bad["error"]["message"] =~ "WebSocket"
+      assert good["type"] == "ok"
+    end
+
+    test "a batch step is a step error", %{key: key} do
+      opts = plug_opts(key)
+      batch = %{"steps" => [%{"stmt" => %{"sql_id" => 3}}]}
+      conn = post(opts, "/v3/pipeline", %{"requests" => [%{"type" => "batch", "batch" => batch}]})
+      [%{"response" => %{"result" => result}}] = decoded(conn)["results"]
+      assert [%{"code" => "FILO_UNSUPPORTED"}] = result["step_errors"]
+    end
+
+    test "v1 execute is a 400 FILO_UNSUPPORTED", %{key: key} do
+      conn = post(plug_opts(key), "/v1/execute", %{"stmt" => %{"sql_id" => 3}})
+      assert conn.status == 400
+      assert decoded(conn)["code"] == "FILO_UNSUPPORTED"
     end
   end
 end

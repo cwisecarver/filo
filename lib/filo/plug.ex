@@ -531,7 +531,7 @@ defmodule Filo.Plug do
         result =
           with {:ok, decoded} <- Error.guard(fn -> Stmt.decode(stmt) end) do
             with_conn(opts, conn, fn db ->
-              case opts.executor.execute(db, decoded) do
+              case Filo.Request.execute(opts.executor, db, decoded) do
                 {:ok, stmt_result} -> {:ok, %{"result" => StmtResult.encode(stmt_result)}}
                 {:error, %Error{} = error} -> {:error, error}
               end
@@ -565,7 +565,7 @@ defmodule Filo.Plug do
               batch_result =
                 Batch.run(
                   decoded,
-                  &opts.executor.execute(db, &1),
+                  &Filo.Request.execute(opts.executor, db, &1),
                   fn -> opts.executor.autocommit?(db) end
                 )
 

@@ -321,7 +321,7 @@ defmodule Filo.Socket do
             result =
               Batch.run(
                 batch,
-                &state.executor.execute(conn, &1),
+                &Request.execute(state.executor, conn, &1),
                 fn -> state.executor.autocommit?(conn) end
               )
 

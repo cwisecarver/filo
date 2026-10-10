@@ -24,7 +24,7 @@ defmodule Filo.Request do
 
   def handle(executor, conn, %{"type" => "execute", "stmt" => stmt}, opts) do
     with {:ok, decoded} <- Error.guard(fn -> Stmt.decode(stmt) end),
-         {:ok, result} <- executor.execute(conn, decoded) do
+         {:ok, result} <- execute(executor, conn, decoded) do
       {:open, ok(%{"type" => "execute", "result" => StmtResult.encode(result, opts)})}
     else
       {:error, %Error{} = error} -> {:open, stream_error(error)}
@@ -35,7 +35,7 @@ defmodule Filo.Request do
     case Error.guard(fn -> Batch.decode(batch) end) do
       {:ok, decoded} ->
         result =
-          Batch.run(decoded, &executor.execute(conn, &1), fn -> executor.autocommit?(conn) end)
+          Batch.run(decoded, &execute(executor, conn, &1), fn -> executor.autocommit?(conn) end)
 
         {:open, ok(%{"type" => "batch", "result" => BatchResult.encode(result, opts)})}
 
@@ -91,6 +91,30 @@ defmodule Filo.Request do
   def handle(_executor, _conn, _request, _opts) do
     {:open, stream_error(Error.bad_request("request must be an object with a type"))}
   end
+
+  @doc false
+  # Runs one statement, refusing one that has no SQL text. A `sql_id` only means something on the
+  # WebSocket binding (it names a `store_sql` entry, which the socket substitutes before dispatch);
+  # on HTTP there is no stored-SQL store, so such a statement used to reach the executor with
+  # `sql: nil` and fail there in whatever way the host happened to (fathom panel2 2026-10-10 H9).
+  # Every transport's statements go through here so the refusal is uniform.
+  @spec execute(module(), Filo.Executor.conn(), Stmt.t()) ::
+          {:ok, StmtResult.t()} | {:error, Error.t()}
+  def execute(_executor, _conn, %Stmt{sql: nil, sql_id: sql_id}) when not is_nil(sql_id) do
+    {:error,
+     %Error{
+       message:
+         "stored SQL (sql_id) is only supported over WebSocket, and no stored statement matches this id",
+       code: "FILO_UNSUPPORTED",
+       status: 400
+     }}
+  end
+
+  def execute(_executor, _conn, %Stmt{sql: nil}) do
+    {:error, Error.bad_request("statement has no sql")}
+  end
+
+  def execute(executor, conn, %Stmt{} = stmt), do: executor.execute(conn, stmt)
 
   defp ok(response), do: %{"type" => "ok", "response" => response}
   defp stream_error(%Error{} = error), do: %{"type" => "error", "error" => Error.encode(error)}
