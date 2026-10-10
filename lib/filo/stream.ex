@@ -26,6 +26,12 @@ defmodule Filo.Stream do
   - After `:idle_timeout` of inactivity the stream expires: it closes its
     connection and stops. Every successful run resets the timer.
 
+  - When its supervisor stops it (`:shutdown`, e.g. on application stop) the
+    stream closes its connection through `c:Filo.Executor.close/1` before it
+    exits. The stream traps exits for this; a linked process that exits
+    abnormally still takes the stream down (with the same reason), but the
+    connection is closed first.
+
   The process is `:temporary` — a dead stream is not restarted; the client must
   open a new one.
   """
@@ -33,6 +39,8 @@ defmodule Filo.Stream do
   use GenServer
 
   import Bitwise
+
+  require Logger
 
   alias Filo.{Batch, Request}
 
@@ -71,7 +79,15 @@ defmodule Filo.Stream do
 
   @doc false
   def child_spec(opts) do
-    %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}, restart: :temporary}
+    # shutdown: the time terminate/2 gets to run the executor's close/1 before the supervisor
+    # escalates to :kill. Stated explicitly (it is the worker default) because the close is the
+    # point of trapping exits: a host's close is a rollback plus a handle release, well inside it.
+    %{
+      id: __MODULE__,
+      start: {__MODULE__, :start_link, [opts]},
+      restart: :temporary,
+      shutdown: 5_000
+    }
   end
 
   @doc """
@@ -121,6 +137,13 @@ defmodule Filo.Stream do
     open_context = Keyword.get(opts, :open_context)
     idle_timeout = Keyword.get(opts, :idle_timeout, @default_idle_timeout)
     state = %__MODULE__{executor: executor, seq: seq, idle_timeout: idle_timeout}
+
+    # Trap exits so a supervisor shutdown runs terminate/2 and with it the executor's close/1
+    # (fathom expert review 2026-10-08 #30). Without it the supervisor's :shutdown exit signal
+    # killed the stream outright: the host never got to roll back and release the connection, so
+    # on every application stop each stream with a live connection left its handle to be reclaimed
+    # by GC. Set before the open so no exit signal can slip past an open connection.
+    Process.flag(:trap_exit, true)
 
     if Keyword.get(opts, :deferred_open, false) do
       # The open can take seconds (a cold shard's storage pull, a failover hold) and a
@@ -222,6 +245,21 @@ defmodule Filo.Stream do
 
   def handle_info({:DOWN, _ref, :process, _pid, _reason}, state), do: {:noreply, state}
 
+  # Trapping exits turns exit signals from linked processes (other than the parent, which
+  # GenServer handles itself by running terminate/2) into messages. Keep the untrapped semantics:
+  # a normal exit of a linked process is ignored, any other reason stops the stream with that same
+  # reason — terminate/2 then closes the connection, which the untrapped kill never did.
+  def handle_info({:EXIT, _pid, :normal}, state), do: {:noreply, state}
+  def handle_info({:EXIT, _pid, reason}, state), do: {:stop, reason, state}
+
+  # Ignore anything else rather than crash on it (fathom expert review 2026-10-08 #27): a stray
+  # message — fathom saw a late watchdog `{:timed_out, ref}` land here — used to kill the stream
+  # with a FunctionClauseError, taking the client's open transaction with it.
+  def handle_info(message, state) do
+    Logger.debug("Filo.Stream ignoring unexpected message: #{inspect(message)}")
+    {:noreply, state}
+  end
+
   defp monitor_owner(executor, conn) do
     case Filo.Executor.owner_pid(executor, conn) do
       nil -> nil
@@ -250,8 +288,8 @@ defmodule Filo.Stream do
   end
 
   # Releases the connection if we still own one, returning the nulled state.
-  # Idempotent: a stream closed via `close`/expiry won't be closed again on
-  # `terminate`.
+  # Idempotent: a stream closed via `close`/expiry/owner-DOWN won't be closed again on
+  # `terminate` — the conn is nil by then, so close/1 runs exactly once per connection.
   defp close_conn(%{conn: nil} = state), do: state
 
   defp close_conn(state) do

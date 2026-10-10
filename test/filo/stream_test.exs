@@ -164,4 +164,92 @@ defmodule Filo.StreamTest do
     assert is_reference(timer)
     assert Process.read_timer(timer) > 0, "the re-armed idle timer must carry a live deadline"
   end
+
+  describe "shutdown and exit signals (fathom expert review 2026-10-08 #30)" do
+    # Symptom: the stream did not trap exits, so a supervisor shutdown (SIGTERM, application stop)
+    # killed it without running terminate/2 — the executor's close/1 never ran, and the host lost
+    # its rollback-and-release of the connection. Invariant: a supervisor stop closes the conn.
+    test "a supervisor shutdown runs the executor's close/1, exactly once" do
+      pid = start_stream(seq: 0)
+      ref = Process.monitor(pid)
+
+      :ok = stop_supervised(Stream)
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, :shutdown}
+      # close/1 sends before terminate/2 returns, so it is already in the mailbox by the DOWN.
+      assert_received {:closed, _conn_ref}, "a supervisor shutdown must close the connection"
+      refute_received {:closed, _}, "the connection was closed twice"
+    end
+
+    test "shutting down the Filo.Streams supervisor closes every open stream's connection" do
+      name = Module.concat(__MODULE__, "Streams#{System.unique_integer([:positive])}")
+      start_supervised!({Filo.Streams, name: name})
+
+      for _ <- 1..3 do
+        {:ok, _id, _seq, _pid} =
+          Filo.Streams.create(name, executor: Echo, open_arg: self(), seq: 0)
+      end
+
+      :ok = stop_supervised(Filo.Streams)
+
+      for _ <- 1..3, do: assert_received({:closed, _conn_ref})
+      refute_received {:closed, _}
+    end
+
+    test "a close request followed by the process exiting closes the connection only once" do
+      pid = start_stream(seq: 0)
+      ref = Process.monitor(pid)
+
+      assert {:ok, :closed, _, nil} = Stream.run(pid, 0, [%{"type" => "close"}])
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+      assert_received {:closed, _conn_ref}
+      refute_received {:closed, _}, "terminate/2 closed a connection the close request released"
+    end
+
+    # Trapping exits must not change what a linked process's exit does to the stream: an abnormal
+    # exit still takes it down with the same reason (now closing the connection first), and a
+    # normal exit is still ignored.
+    @tag :capture_log
+    test "a linked process exiting abnormally stops the stream with that reason, closing the conn" do
+      pid = start_stream(seq: 0)
+      ref = Process.monitor(pid)
+
+      spawn(fn ->
+        Process.link(pid)
+        exit(:boom)
+      end)
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, :boom}
+      assert_received {:closed, _conn_ref}
+      refute_received {:closed, _}
+    end
+
+    test "a linked process exiting normally leaves the stream running" do
+      pid = start_stream(seq: 0)
+      linked = spawn(fn -> Process.link(pid) end)
+      lref = Process.monitor(linked)
+      assert_receive {:DOWN, ^lref, :process, ^linked, _}
+
+      _ = :sys.get_state(pid)
+      assert {:ok, :open, [_], 1} = Stream.run(pid, 0, [execute_req()])
+      refute_received {:closed, _}
+    end
+  end
+
+  # fathom expert review 2026-10-08 #27. Symptom: handle_info/2 matched only :expire and :DOWN, so
+  # any other message — fathom hit a late watchdog `{:timed_out, ref}` — crashed the stream with a
+  # FunctionClauseError and lost the client's open transaction. Invariant: unknown messages are
+  # ignored and the stream keeps serving on the same baton.
+  test "an unexpected message does not kill the stream" do
+    pid = start_stream(seq: 0)
+    ref = Process.monitor(pid)
+
+    send(pid, {:timed_out, make_ref()})
+    send(pid, :some_stray_message)
+
+    assert {:ok, :open, [_], 1} = Stream.run(pid, 0, [execute_req()])
+    refute_received {:DOWN, ^ref, :process, ^pid, _}
+    refute_received {:closed, _}
+  end
 end
