@@ -42,6 +42,13 @@ defmodule Filo.Plug do
     - `:base_url` — value returned in each response's `base_url`. Default `nil`.
     - `:idle_timeout` — per-stream inactivity timeout in ms. Default uses
       `Filo.Stream`'s.
+    - `:call_timeout` — how long the plug waits for a stream to answer one request, in ms.
+      Default `:infinity`: the executor bounds its own statements (fathom's is 30 s), and a
+      shorter plug-side wait would abandon a statement that may still commit while telling the
+      client the stream is gone. If a finite value expires, the stream is shut down (its
+      connection closed once the in-flight request returns) and the request answers `504`
+      with code `FILO_STREAM_TIMEOUT` — distinct from the `400` `STREAM_NOT_FOUND` of a
+      stream that is merely gone.
 
   ## Pipeline flow
 
@@ -71,6 +78,7 @@ defmodule Filo.Plug do
       authorize: Keyword.get(opts, :authorize),
       base_url: Keyword.get(opts, :base_url),
       idle_timeout: Keyword.get(opts, :idle_timeout),
+      call_timeout: Keyword.get(opts, :call_timeout, :infinity),
       # Per-stream process policy, forwarded verbatim to Filo.Stream.start_link/1 (fathom expert
       # review 2026-07-24 #22). A stream is idle-dominant and long-lived, so the host may want a
       # hibernation / GC policy; filo has no opinion, it just stops dropping the options.
@@ -258,7 +266,7 @@ defmodule Filo.Plug do
   end
 
   defp run(opts, stream_id, pid, seq, requests, enc_opts) do
-    case Stream.run(pid, seq, requests, enc_opts) do
+    case Stream.run(pid, seq, requests, [call_timeout: opts.call_timeout] ++ enc_opts) do
       {:ok, :open, results, next_seq} ->
         {:ok, Baton.encode(stream_id, next_seq, opts.key), results}
 
@@ -269,9 +277,21 @@ defmodule Filo.Plug do
         {:error, 400, %Error{message: "baton reused", code: "BATON_REUSED"}}
     end
   catch
-    # The stream was looked up but died (idle-expired) before the call landed.
-    :exit, _ ->
-      {:error, 400, %Error{message: "stream not found", code: "STREAM_NOT_FOUND"}}
+    :exit, reason -> stream_exit(pid, reason)
+  end
+
+  # The call to a looked-up stream exited. A `{:timeout, _}` means the stream is alive but did not
+  # answer within `:call_timeout`: ask it to shut down (the stream traps exits, so terminate/2
+  # closes its connection once the in-flight request returns - a :kill would skip the close and
+  # leak the handle) so the baton can't be reused, and say so with a distinct 5xx. Any other exit
+  # is a stream that died (idle-expired) before the call landed.
+  defp stream_exit(pid, {:timeout, _}) do
+    Process.exit(pid, :shutdown)
+    {:error, 504, %Error{message: "stream timed out", code: "FILO_STREAM_TIMEOUT"}}
+  end
+
+  defp stream_exit(_pid, _reason) do
+    {:error, 400, %Error{message: "stream not found", code: "STREAM_NOT_FOUND"}}
   end
 
   defp handle_cursor(conn, opts, :json) do
@@ -410,7 +430,7 @@ defmodule Filo.Plug do
   end
 
   defp run_cursor(opts, stream_id, pid, seq, batch, enc_opts) do
-    case Stream.run_cursor(pid, seq, batch) do
+    case Stream.run_cursor(pid, seq, batch, opts.call_timeout) do
       {:ok, %BatchResult{} = result, next_seq} ->
         {:ok, Baton.encode(stream_id, next_seq, opts.key), Cursor.entries(result, enc_opts)}
 
@@ -418,8 +438,7 @@ defmodule Filo.Plug do
         {:error, 400, %Error{message: "baton reused", code: "BATON_REUSED"}}
     end
   catch
-    :exit, _ ->
-      {:error, 400, %Error{message: "stream not found", code: "STREAM_NOT_FOUND"}}
+    :exit, reason -> stream_exit(pid, reason)
   end
 
   defp new_stream_opts(opts, arg, context),

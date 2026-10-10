@@ -101,11 +101,18 @@ defmodule Filo.Stream do
 
   `opts` pass through to `Filo.Request.handle/4`'s result encoders (`rows: :json` for the
   JSON transports' pre-encoded row fragments; default `:maps` for protobuf).
+
+  `:call_timeout` (in `opts`, not forwarded) bounds the `GenServer.call` in ms. It defaults
+  to `:infinity`: the executor bounds its own statements, and a caller-side timeout shorter
+  than the executor's deadline abandons a statement that may still commit while the client
+  is told the stream is gone. When a finite timeout does expire the call exits with
+  `{:timeout, _}`; `Filo.Plug` kills the stream then (see its `:call_timeout`).
   """
   @spec run(GenServer.server(), non_neg_integer(), [map()], keyword()) ::
           {:ok, Request.status(), [map()], non_neg_integer() | nil} | {:error, :baton_reused}
   def run(server, seq, requests, opts \\ []) do
-    GenServer.call(server, {:run, seq, requests, opts})
+    {timeout, opts} = Keyword.pop(opts, :call_timeout, :infinity)
+    GenServer.call(server, {:run, seq, requests, opts}, timeout)
   end
 
   @doc """
@@ -123,10 +130,10 @@ defmodule Filo.Stream do
   rotated sequence. Like `run/3`, a mismatched `seq` is `{:error, :baton_reused}`.
   The stream stays open.
   """
-  @spec run_cursor(GenServer.server(), non_neg_integer(), map()) ::
+  @spec run_cursor(GenServer.server(), non_neg_integer(), map(), timeout()) ::
           {:ok, Filo.BatchResult.t(), non_neg_integer()} | {:error, :baton_reused}
-  def run_cursor(server, seq, batch) do
-    GenServer.call(server, {:run_cursor, seq, batch})
+  def run_cursor(server, seq, batch, timeout \\ :infinity) do
+    GenServer.call(server, {:run_cursor, seq, batch}, timeout)
   end
 
   @impl true
