@@ -61,6 +61,26 @@ defmodule Filo.Plug do
   the stream it names. Each response carries a fresh `baton` for the next request
   (or `null` once the stream is closed). A reused, forged, or malformed baton, or
   a baton for a stream that has been closed or expired, is rejected with `400`.
+
+  ## Which errors mean "reopen and replay"
+
+  A baton'd stream can be lost (idle expiry, a node restart, the connection's owner dying, a drain,
+  a stream timeout). The client cannot recover it; it must open a new stream (a request with no
+  baton) and replay whatever transaction it had open. The response `code` says which case it is:
+
+    | status | `code`                | meaning                                              | client action |
+    |--------|-----------------------|------------------------------------------------------|---------------|
+    | 400    | `STREAM_NOT_FOUND`    | the stream is gone; any open transaction was rolled back | reopen and replay |
+    | 400    | `BATON_REUSED`        | the baton was already spent (a retried request whose first response was lost) - the stream moved on and its new baton is unrecoverable | reopen and replay |
+    | 400    | `BATON_INVALID`       | forged, malformed, or signed with a different key (e.g. after a key rotation) | reopen; do not blindly replay |
+    | 504    | `FILO_STREAM_TIMEOUT` | the stream did not answer within `:call_timeout` and was shut down; whether the in-flight statement committed is unknown | reopen; replay only idempotent work |
+    | 400    | `FILO_BAD_REQUEST`    | the request itself is malformed                      | fix the request; replaying cannot help |
+    | 413    | `FILO_BODY_TOO_LARGE` | the body exceeded `:max_body`                        | send less |
+    | 400    | `FILO_UNSUPPORTED`    | e.g. `sql_id` (stored SQL is WebSocket-only)         | do not retry on HTTP |
+
+  Other statuses come from the executor's `Filo.Error` (`open/1` failures keep their `status`).
+  Fathom-style hosts that return `400` for a lost stream do so on purpose: it is the status the
+  libSQL SDKs treat as "stream expired, reopen".
   """
 
   @behaviour Plug

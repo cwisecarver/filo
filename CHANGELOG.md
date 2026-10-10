@@ -7,6 +7,52 @@ Filo uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 version is below `1.0.0`, the **minor** number carries breaking changes as well as
 features; patch releases stay backward compatible.
 
+## [Unreleased]
+
+Fixes and additions from fathom's 2026-10-10 expert review (second panel). No
+breaking changes; no new required `Filo.Executor` callback.
+
+### Fixed
+
+- **`Filo.Plug` no longer cuts a slow request off at 5 s.** `Filo.Stream.run/4`
+  used `GenServer.call`'s default timeout, shorter than a host's statement
+  deadline, so a statement that was merely slow was answered `400
+  STREAM_NOT_FOUND` while it could still commit, and the baton was lost. The
+  new `:call_timeout` option defaults to `:infinity` (the executor bounds its
+  own statements). If a finite value expires the stream is shut down and the
+  request answers `504` with code `FILO_STREAM_TIMEOUT`.
+- **A stale idle-expiry no longer kills a live stream.** The expiry message now
+  carries the timer's ref; one that queued behind a running request and was
+  superseded is ignored instead of stopping the stream right after it acked.
+- **Malformed requests are answered, not crashed on.** A value that failed to
+  decode (non-numeric integer, unknown value type, `args`/`steps`/`requests` of
+  the wrong shape, a non-integer batch condition step, garbage protobuf, a
+  non-integer `max_count`) raised inside the WebSocket process or stream,
+  killing the connection and every open transaction on it. These are now
+  `FILO_BAD_REQUEST` (a per-request error in pipelines and over WebSocket, `400`
+  on the v1 and cursor endpoints and for bad protobuf bodies).
+- **The request-body cap is real.** `@max_body` bounded each `read_body` call,
+  but `{:more, _}` was looped on, so an unauthenticated client could stream an
+  unbounded body. A body over the cap is now `413` with a Hrana-shaped error
+  (`FILO_BODY_TOO_LARGE`). The cap is the new `:max_body` option, default 8 MB.
+- **A statement with only a `sql_id` is refused over HTTP** with
+  `FILO_UNSUPPORTED` (stored SQL is WebSocket-only) instead of reaching the
+  executor with `sql: nil`. All transports run statements through the new
+  `Filo.Request.execute/3`.
+
+### Added
+
+- **WebSocket idle bounds.** `:hello_timeout` (default 10 s; closes 1008) and
+  `:txn_idle_timeout` (default 30 s; a stream idle that long while inside a
+  transaction, per `Executor.autocommit?/1`, is closed and so rolled back).
+  `Filo.Plug` forwards both to `Filo.Socket`; `:infinity` disables.
+- **Server-initiated close.** `Filo.Socket.drain/1` (graceful, WebSocket 1001
+  once no stream is in a transaction), `Filo.Socket.close/1` (forced 1001),
+  `Filo.Stream.drain/1` and `Filo.Streams.drain/1` (close HTTP streams that are
+  not in a transaction). A WebSocket's process is where `Executor.open/1` runs,
+  so an executor can record `self()` there.
+- **Docs:** `Filo.Plug` now lists which error codes mean "reopen and replay".
+
 ## [0.3.2] — 2026-10-09
 
 Two `Filo.Stream` fixes from fathom's 2026-10-08 expert review. Patch release:
