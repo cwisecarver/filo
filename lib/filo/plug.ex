@@ -212,38 +212,50 @@ defmodule Filo.Plug do
   defp handle_pipeline(conn, opts, :protobuf) do
     case read_all(conn, "") do
       {:ok, body, conn} ->
-        decoded = Protobuf.Http.decode_pipeline_req(body)
-
-        # rows: :protobuf — the stream process encodes rows to protobuf bytes itself, so the
-        # reply crosses to this process as one binary, not a deep copy of tagged maps
-        # (fathom expert review 2026-10-01 #37).
-        case dispatch(opts, conn, Map.get(decoded, "baton"), Map.get(decoded, "requests", []),
-               rows: :protobuf
-             ) do
-          {:ok, new_baton, results} ->
-            send_protobuf(
-              conn,
-              200,
-              Protobuf.Http.encode_pipeline_resp(%{
-                "baton" => new_baton,
-                "base_url" => opts.base_url,
-                "results" => results
-              })
-            )
-
-          {:error, status, %Error{} = error} ->
-            send_protobuf(conn, status, Protobuf.encode_error(Error.encode(error)))
-        end
+        decode_protobuf(conn, fn -> Protobuf.Http.decode_pipeline_req(body) end, fn decoded ->
+          pipeline_protobuf(conn, opts, decoded)
+        end)
 
       {:error, conn} ->
         send_protobuf(conn, 400, bad_request_pb())
     end
   end
 
+  defp pipeline_protobuf(conn, opts, decoded) do
+    # rows: :protobuf — the stream process encodes rows to protobuf bytes itself, so the
+    # reply crosses to this process as one binary, not a deep copy of tagged maps
+    # (fathom expert review 2026-10-01 #37).
+    case dispatch(opts, conn, Map.get(decoded, "baton"), Map.get(decoded, "requests", []),
+           rows: :protobuf
+         ) do
+      {:ok, new_baton, results} ->
+        send_protobuf(
+          conn,
+          200,
+          Protobuf.Http.encode_pipeline_resp(%{
+            "baton" => new_baton,
+            "base_url" => opts.base_url,
+            "results" => results
+          })
+        )
+
+      {:error, status, %Error{} = error} ->
+        send_protobuf(conn, status, Protobuf.encode_error(Error.encode(error)))
+    end
+  end
+
+  # Malformed protobuf makes the wire decoder raise; that is a 400, not a 500 from the endpoint.
+  defp decode_protobuf(conn, decoder, next) do
+    case Error.guard(decoder) do
+      {:ok, decoded} -> next.(decoded)
+      {:error, _} -> send_protobuf(conn, 400, bad_request_pb())
+    end
+  end
+
   # No baton: authorize, open a fresh stream, then run the pipeline against it. A baton
   # request (below) skips re-auth: the baton is a signed capability minted only after an
   # authorized open, and it names the stream it was minted for.
-  defp dispatch(opts, conn, nil, requests, enc_opts) do
+  defp dispatch(opts, conn, nil, requests, enc_opts) when is_list(requests) do
     arg = open_arg(opts, conn)
 
     with {:ok, context} <- authorize(opts, arg, bearer_token(conn)) do
@@ -258,11 +270,18 @@ defmodule Filo.Plug do
   end
 
   # Baton present: resolve it to a live stream and run the pipeline.
-  defp dispatch(opts, _conn, baton, requests, enc_opts) when is_binary(baton) do
+  defp dispatch(opts, _conn, baton, requests, enc_opts)
+       when is_binary(baton) and is_list(requests) do
     with {:ok, {stream_id, seq}} <- decode_baton(baton, opts.key),
          {:ok, pid} <- find_stream(opts.streams, stream_id) do
       run(opts, stream_id, pid, seq, requests, enc_opts)
     end
+  end
+
+  # A baton that is not a string, or `requests` that is not a list: answer 400 rather than crash
+  # the request on a function clause (fathom expert review 2026-10-10 panel2 H8).
+  defp dispatch(_opts, _conn, _baton, _requests, _enc_opts) do
+    {:error, 400, Error.bad_request("baton must be a string and requests a list")}
   end
 
   defp run(opts, stream_id, pid, seq, requests, enc_opts) do
@@ -329,37 +348,41 @@ defmodule Filo.Plug do
   defp handle_cursor(conn, opts, :protobuf) do
     case read_all(conn, "") do
       {:ok, body, conn} ->
-        decoded = Protobuf.Http.decode_cursor_req(body)
-
-        case Map.get(decoded, "batch") do
-          nil ->
-            send_protobuf(conn, 400, bad_request_pb("missing batch"))
-
-          batch ->
-            case dispatch_cursor(opts, conn, Map.get(decoded, "baton"), batch, rows: :maps) do
-              {:ok, new_baton, entries} ->
-                # Response is a stream of length-delimited protobufs: the
-                # CursorRespBody first, then one CursorEntry per entry.
-                head =
-                  Protobuf.Http.encode_cursor_resp(%{
-                    "baton" => new_baton,
-                    "base_url" => opts.base_url
-                  })
-
-                frames = [
-                  Wire.delimit(head)
-                  | Enum.map(entries, &Wire.delimit(Protobuf.encode_cursor_entry(&1)))
-                ]
-
-                send_protobuf(conn, 200, frames)
-
-              {:error, status, %Error{} = error} ->
-                send_protobuf(conn, status, Protobuf.encode_error(Error.encode(error)))
-            end
-        end
+        decode_protobuf(conn, fn -> Protobuf.Http.decode_cursor_req(body) end, fn decoded ->
+          cursor_protobuf(conn, opts, decoded)
+        end)
 
       {:error, conn} ->
         send_protobuf(conn, 400, bad_request_pb())
+    end
+  end
+
+  defp cursor_protobuf(conn, opts, decoded) do
+    case Map.get(decoded, "batch") do
+      nil ->
+        send_protobuf(conn, 400, bad_request_pb("missing batch"))
+
+      batch ->
+        case dispatch_cursor(opts, conn, Map.get(decoded, "baton"), batch, rows: :maps) do
+          {:ok, new_baton, entries} ->
+            # Response is a stream of length-delimited protobufs: the
+            # CursorRespBody first, then one CursorEntry per entry.
+            head =
+              Protobuf.Http.encode_cursor_resp(%{
+                "baton" => new_baton,
+                "base_url" => opts.base_url
+              })
+
+            frames = [
+              Wire.delimit(head)
+              | Enum.map(entries, &Wire.delimit(Protobuf.encode_cursor_entry(&1)))
+            ]
+
+            send_protobuf(conn, 200, frames)
+
+          {:error, status, %Error{} = error} ->
+            send_protobuf(conn, status, Protobuf.encode_error(Error.encode(error)))
+        end
     end
   end
 
@@ -418,6 +441,10 @@ defmodule Filo.Plug do
     end
   end
 
+  defp dispatch_cursor(_opts, _conn, _baton, _batch, _enc_opts) do
+    {:error, 400, Error.bad_request("baton must be a string")}
+  end
+
   # A stream open that failed carrying the executor's own Filo.Error propagates that error and its
   # HTTP status hint (a client error like a missing/invalid shard → 400, at-capacity → 503) instead
   # of a blanket 500, so the client sees why the open was refused. Any other failure stays a 500.
@@ -433,6 +460,9 @@ defmodule Filo.Plug do
     case Stream.run_cursor(pid, seq, batch, opts.call_timeout) do
       {:ok, %BatchResult{} = result, next_seq} ->
         {:ok, Baton.encode(stream_id, next_seq, opts.key), Cursor.entries(result, enc_opts)}
+
+      {:error, %Error{} = error} ->
+        {:error, error.status || 400, error}
 
       {:error, :baton_reused} ->
         {:error, 400, %Error{message: "baton reused", code: "BATON_REUSED"}}
@@ -478,12 +508,14 @@ defmodule Filo.Plug do
     case read_request(conn) do
       {:ok, %{"stmt" => stmt}, conn} ->
         result =
-          with_conn(opts, conn, fn db ->
-            case opts.executor.execute(db, Stmt.decode(stmt)) do
-              {:ok, stmt_result} -> {:ok, %{"result" => StmtResult.encode(stmt_result)}}
-              {:error, %Error{} = error} -> {:error, error}
-            end
-          end)
+          with {:ok, decoded} <- Error.guard(fn -> Stmt.decode(stmt) end) do
+            with_conn(opts, conn, fn db ->
+              case opts.executor.execute(db, decoded) do
+                {:ok, stmt_result} -> {:ok, %{"result" => StmtResult.encode(stmt_result)}}
+                {:error, %Error{} = error} -> {:error, error}
+              end
+            end)
+          end
 
         respond_v1(conn, result)
 
@@ -507,17 +539,18 @@ defmodule Filo.Plug do
     case read_request(conn) do
       {:ok, %{"batch" => batch}, conn} ->
         result =
-          with_conn(opts, conn, fn db ->
-            batch_result =
-              batch
-              |> Batch.decode()
-              |> Batch.run(
-                &opts.executor.execute(db, &1),
-                fn -> opts.executor.autocommit?(db) end
-              )
+          with {:ok, decoded} <- Error.guard(fn -> Batch.decode(batch) end) do
+            with_conn(opts, conn, fn db ->
+              batch_result =
+                Batch.run(
+                  decoded,
+                  &opts.executor.execute(db, &1),
+                  fn -> opts.executor.autocommit?(db) end
+                )
 
-            {:ok, %{"result" => BatchResult.encode(batch_result)}}
-          end)
+              {:ok, %{"result" => BatchResult.encode(batch_result)}}
+            end)
+          end
 
         respond_v1(conn, result)
 

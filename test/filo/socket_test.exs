@@ -298,4 +298,99 @@ defmodule Filo.SocketTest do
     assert_receive {:closed, _ref1}
     assert_receive {:closed, _ref2}
   end
+
+  # H8 (fathom panel2 2026-10-10): client-supplied values that fail to decode raised inside the
+  # socket process, killing the connection and every stream (and open transaction) on it. Invariant:
+  # a malformed request is a response_error FILO_BAD_REQUEST and the socket stays usable.
+  describe "malformed requests" do
+    @bad_value %{"type" => "integer", "value" => "not-a-number"}
+
+    defp bad_request?(state, request) do
+      {resp, state} = pushed(send_msg(state, req(500, request)))
+      assert resp["type"] == "response_error", inspect(resp)
+      assert resp["error"]["code"] == "FILO_BAD_REQUEST"
+
+      # still alive and usable
+      {ok, state} =
+        pushed(send_msg(state, req(501, %{"type" => "get_autocommit", "stream_id" => 1})))
+
+      assert ok["type"] == "response_ok"
+      state
+    end
+
+    setup do
+      %{state: open_socket() |> hello() |> open_stream(1)}
+    end
+
+    test "an undecodable argument value", %{state: state} do
+      bad_request?(state, %{
+        "type" => "execute",
+        "stream_id" => 1,
+        "stmt" => %{"sql" => "SELECT ?", "args" => [@bad_value]}
+      })
+    end
+
+    test "an unknown value type and a non-list args", %{state: state} do
+      state =
+        bad_request?(state, %{
+          "type" => "execute",
+          "stream_id" => 1,
+          "stmt" => %{"sql" => "SELECT ?", "args" => [%{"type" => "bogus"}]}
+        })
+
+      bad_request?(state, %{
+        "type" => "execute",
+        "stream_id" => 1,
+        "stmt" => %{"sql" => "SELECT ?", "args" => 5}
+      })
+    end
+
+    test "a batch with the wrong shape or a bad condition", %{state: state} do
+      state =
+        bad_request?(state, %{"type" => "batch", "stream_id" => 1, "batch" => %{"steps" => 5}})
+
+      bad_request?(state, %{
+        "type" => "batch",
+        "stream_id" => 1,
+        "batch" => %{
+          "steps" => [
+            %{
+              "stmt" => %{"sql" => "SELECT 1"},
+              "condition" => %{"type" => "ok", "step" => "zero"}
+            }
+          ]
+        }
+      })
+    end
+
+    test "open_cursor with an undecodable batch", %{state: state} do
+      bad_request?(state, %{
+        "type" => "open_cursor",
+        "stream_id" => 1,
+        "cursor_id" => 1,
+        "batch" => %{"steps" => [%{"stmt" => %{"sql" => "SELECT ?", "args" => [@bad_value]}}]}
+      })
+    end
+
+    test "fetch_cursor with a non-integer max_count", %{state: state} do
+      {_, state} =
+        pushed(
+          send_msg(
+            state,
+            req(2, %{
+              "type" => "open_cursor",
+              "stream_id" => 1,
+              "cursor_id" => 7,
+              "batch" => %{"steps" => [%{"stmt" => %{"sql" => "SELECT 1"}}]}
+            })
+          )
+        )
+
+      bad_request?(state, %{"type" => "fetch_cursor", "cursor_id" => 7, "max_count" => "all"})
+    end
+
+    test "a request that is not an object", %{state: state} do
+      bad_request?(state, 5)
+    end
+  end
 end

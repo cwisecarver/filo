@@ -89,4 +89,82 @@ defmodule Filo.PlugHardeningTest do
       assert decoded(conn)["code"] == "STREAM_NOT_FOUND"
     end
   end
+
+  # H8 (fathom panel2 2026-10-10): decode failures raised in the plug or inside the stream process
+  # (killing the stream and its open transaction). Invariant: a malformed body is a 400
+  # FILO_BAD_REQUEST and a baton'd stream survives it.
+  describe "malformed requests" do
+    @bad_value %{"type" => "integer", "value" => "not-a-number"}
+
+    defp assert_bad_request(conn) do
+      assert conn.status == 400, inspect({conn.status, conn.resp_body})
+      assert decoded(conn)["code"] == "FILO_BAD_REQUEST"
+    end
+
+    test "v1 execute and batch with undecodable values", %{key: key} do
+      opts = plug_opts(key)
+
+      assert_bad_request(
+        post(opts, "/v1/execute", %{"stmt" => %{"sql" => "SELECT ?", "args" => [@bad_value]}})
+      )
+
+      assert_bad_request(
+        post(opts, "/v1/batch", %{
+          "batch" => %{"steps" => [%{"stmt" => %{"sql" => "SELECT ?", "args" => [@bad_value]}}]}
+        })
+      )
+    end
+
+    test "a pipeline whose requests is not a list, or whose baton is not a string", %{key: key} do
+      opts = plug_opts(key)
+      assert_bad_request(post(opts, "/v3/pipeline", %{"requests" => "SELECT 1"}))
+      assert_bad_request(post(opts, "/v3/pipeline", %{"baton" => 5, "requests" => []}))
+      assert_bad_request(post(opts, "/v3/cursor", %{"baton" => 5, "batch" => %{"steps" => []}}))
+    end
+
+    test "a bad stmt inside a pipeline is a per-request error and the stream survives", %{
+      key: key
+    } do
+      opts = plug_opts(key)
+
+      bad = %{"type" => "execute", "stmt" => %{"sql" => "SELECT ?", "args" => [@bad_value]}}
+      first = post(opts, "/v3/pipeline", %{"requests" => [bad, "junk", exec_req("SELECT 1")]})
+      assert first.status == 200
+      [r1, r2, r3] = decoded(first)["results"]
+      assert r1["error"]["code"] == "FILO_BAD_REQUEST"
+      assert r2["error"]["code"] == "FILO_BAD_REQUEST"
+      assert r3["type"] == "ok"
+
+      next =
+        post(opts, "/v3/pipeline", %{
+          "baton" => decoded(first)["baton"],
+          "requests" => [exec_req("SELECT 1")]
+        })
+
+      assert next.status == 200
+    end
+
+    test "a cursor with an undecodable batch is a 400 and the stream survives", %{key: key} do
+      opts = plug_opts(key)
+      first = post(opts, "/v3/pipeline", %{"requests" => [exec_req("SELECT 1")]})
+      baton = decoded(first)["baton"]
+
+      bad = %{"steps" => [%{"stmt" => %{"sql" => "SELECT ?", "args" => [@bad_value]}}]}
+      assert_bad_request(post(opts, "/v3/cursor", %{"baton" => baton, "batch" => bad}))
+
+      # The same baton still works: the stream was not killed and its seq was not consumed.
+      ok = post(opts, "/v3/pipeline", %{"baton" => baton, "requests" => [exec_req("SELECT 1")]})
+      assert ok.status == 200
+    end
+
+    test "garbage protobuf bodies are 400, not a crash", %{key: key} do
+      opts = plug_opts(key)
+
+      for path <- ["/v3-protobuf/pipeline", "/v3-protobuf/cursor"],
+          body <- [<<255, 255, 255>>, <<10, 200, 1>>, <<8>>] do
+        conn = post(opts, path, body, "application/x-protobuf")
+        assert conn.status == 400, "#{path} #{inspect(body)} -> #{conn.status}"
+      end
+    end
+  end
 end

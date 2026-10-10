@@ -42,7 +42,7 @@ defmodule Filo.Stream do
 
   require Logger
 
-  alias Filo.{Batch, Request}
+  alias Filo.{Batch, Error, Request}
 
   @default_idle_timeout 10_000
   @u64_mask 0xFFFFFFFFFFFFFFFF
@@ -128,10 +128,13 @@ defmodule Filo.Stream do
   Runs a decoded Hrana batch map against the stream for a cursor, returning the
   raw `Filo.BatchResult` (which the caller streams as cursor entries) and the
   rotated sequence. Like `run/3`, a mismatched `seq` is `{:error, :baton_reused}`.
-  The stream stays open.
+  The stream stays open. A batch that cannot be decoded is `{:error, %Filo.Error{}}`
+  (`FILO_BAD_REQUEST`) and does not consume the seq.
   """
   @spec run_cursor(GenServer.server(), non_neg_integer(), map(), timeout()) ::
-          {:ok, Filo.BatchResult.t(), non_neg_integer()} | {:error, :baton_reused}
+          {:ok, Filo.BatchResult.t(), non_neg_integer()}
+          | {:error, :baton_reused}
+          | {:error, Error.t()}
   def run_cursor(server, seq, batch, timeout \\ :infinity) do
     GenServer.call(server, {:run_cursor, seq, batch}, timeout)
   end
@@ -226,16 +229,23 @@ defmodule Filo.Stream do
   end
 
   def handle_call({:run_cursor, _seq, batch}, _from, state) do
-    result =
-      batch
-      |> Batch.decode()
-      |> Batch.run(
-        &state.executor.execute(state.conn, &1),
-        fn -> state.executor.autocommit?(state.conn) end
-      )
+    # A malformed batch is answered, not raised: a raise here would kill the stream (and roll
+    # back the client's open transaction) over a bad request. The seq is not consumed.
+    case Error.guard(fn -> Batch.decode(batch) end) do
+      {:ok, decoded} ->
+        result =
+          Batch.run(
+            decoded,
+            &state.executor.execute(state.conn, &1),
+            fn -> state.executor.autocommit?(state.conn) end
+          )
 
-    next = state.seq + 1 &&& @u64_mask
-    {:reply, {:ok, result, next}, arm_timer(%{state | seq: next})}
+        next = state.seq + 1 &&& @u64_mask
+        {:reply, {:ok, result, next}, arm_timer(%{state | seq: next})}
+
+      {:error, %Error{} = error} ->
+        {:reply, {:error, error}, state}
+    end
   end
 
   @impl true

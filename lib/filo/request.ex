@@ -23,22 +23,25 @@ defmodule Filo.Request do
   def handle(executor, conn, request, opts \\ [])
 
   def handle(executor, conn, %{"type" => "execute", "stmt" => stmt}, opts) do
-    case executor.execute(conn, Stmt.decode(stmt)) do
-      {:ok, result} ->
-        {:open, ok(%{"type" => "execute", "result" => StmtResult.encode(result, opts)})}
-
-      {:error, %Error{} = error} ->
-        {:open, stream_error(error)}
+    with {:ok, decoded} <- Error.guard(fn -> Stmt.decode(stmt) end),
+         {:ok, result} <- executor.execute(conn, decoded) do
+      {:open, ok(%{"type" => "execute", "result" => StmtResult.encode(result, opts)})}
+    else
+      {:error, %Error{} = error} -> {:open, stream_error(error)}
     end
   end
 
   def handle(executor, conn, %{"type" => "batch", "batch" => batch}, opts) do
-    result =
-      batch
-      |> Batch.decode()
-      |> Batch.run(&executor.execute(conn, &1), fn -> executor.autocommit?(conn) end)
+    case Error.guard(fn -> Batch.decode(batch) end) do
+      {:ok, decoded} ->
+        result =
+          Batch.run(decoded, &executor.execute(conn, &1), fn -> executor.autocommit?(conn) end)
 
-    {:open, ok(%{"type" => "batch", "result" => BatchResult.encode(result, opts)})}
+        {:open, ok(%{"type" => "batch", "result" => BatchResult.encode(result, opts)})}
+
+      {:error, %Error{} = error} ->
+        {:open, stream_error(error)}
+    end
   end
 
   def handle(executor, conn, %{"type" => "describe", "sql" => sql}, _opts) when is_binary(sql) do
@@ -78,8 +81,15 @@ defmodule Filo.Request do
   end
 
   def handle(_executor, _conn, %{"type" => type}, _opts) do
+    name = if is_binary(type), do: type, else: inspect(type)
+
     {:open,
-     stream_error(%Error{message: "unsupported request type: #{type}", code: "FILO_UNSUPPORTED"})}
+     stream_error(%Error{message: "unsupported request type: #{name}", code: "FILO_UNSUPPORTED"})}
+  end
+
+  # Not even a map with a type (e.g. a bare string in the `requests` list).
+  def handle(_executor, _conn, _request, _opts) do
+    {:open, stream_error(Error.bad_request("request must be an object with a type"))}
   end
 
   defp ok(response), do: %{"type" => "ok", "response" => response}

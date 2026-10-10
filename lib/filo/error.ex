@@ -17,6 +17,24 @@ defmodule Filo.Error do
 
   defstruct message: "", code: nil, status: nil
 
+  @doc false
+  # The error for a request the server could not decode (fathom expert review 2026-10-10 panel2 H8).
+  @spec bad_request(String.t()) :: t()
+  def bad_request(message \\ "malformed request"),
+    do: %__MODULE__{message: message, code: "FILO_BAD_REQUEST", status: 400}
+
+  @doc false
+  # Runs a pure decoder, turning ANY raise into `{:error, bad_request}`. Client-supplied JSON/protobuf
+  # reaches decoders that pattern-match and `String.to_integer`; a malformed value must be answered
+  # with an error, not crash the socket or stream process that owns the client's open transaction.
+  # Only decoding goes through here - an executor's own failures are never swallowed.
+  @spec guard((-> a)) :: {:ok, a} | {:error, t()} when a: term()
+  def guard(decoder) when is_function(decoder, 0) do
+    {:ok, decoder.()}
+  rescue
+    _ -> {:error, bad_request()}
+  end
+
   @doc "Encodes a `Filo.Error` into a Hrana `Error` map (the `status` hint is HTTP-only, not wire)."
   @spec encode(t()) :: map()
   def encode(%__MODULE__{} = error) do

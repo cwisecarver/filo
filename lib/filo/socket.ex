@@ -247,7 +247,8 @@ defmodule Filo.Socket do
     end
   end
 
-  defp handle_request(%{"type" => "store_sql", "sql_id" => sql_id, "sql" => sql}, state) do
+  defp handle_request(%{"type" => "store_sql", "sql_id" => sql_id, "sql" => sql}, state)
+       when is_binary(sql) do
     cond do
       Map.has_key?(state.sqls, sql_id) ->
         {{:error, encode(error("sql_id #{sql_id} is already stored", "SQL_EXISTS"))}, state}
@@ -306,31 +307,46 @@ defmodule Filo.Socket do
 
       true ->
         conn = Map.fetch!(state.streams, sid)
-        %{"batch" => batch} = resolve_sql(%{"batch" => batch}, state.sqls)
 
-        result =
-          batch
-          |> Batch.decode()
-          |> Batch.run(
-            &state.executor.execute(conn, &1),
-            fn -> state.executor.autocommit?(conn) end
-          )
+        # Decode failures (a client-supplied batch of the wrong shape) are answered, not raised:
+        # a raise would kill the socket and every stream on it (fathom panel2 2026-10-10 H8).
+        decoded =
+          Error.guard(fn ->
+            %{"batch" => batch} = resolve_sql(%{"batch" => batch}, state.sqls)
+            Batch.decode(batch)
+          end)
 
-        entries = Cursor.entries(result, rows_opt(state))
+        case decoded do
+          {:ok, batch} ->
+            result =
+              Batch.run(
+                batch,
+                &state.executor.execute(conn, &1),
+                fn -> state.executor.autocommit?(conn) end
+              )
 
-        {{:ok, %{"type" => "open_cursor"}},
-         %{state | cursors: Map.put(state.cursors, cid, entries)}}
+            entries = Cursor.entries(result, rows_opt(state))
+
+            {{:ok, %{"type" => "open_cursor"}},
+             %{state | cursors: Map.put(state.cursors, cid, entries)}}
+
+          {:error, %Error{} = error} ->
+            {{:error, encode(error)}, state}
+        end
     end
   end
 
   defp handle_request(%{"type" => "fetch_cursor", "cursor_id" => cid} = request, state) do
-    case Map.fetch(state.cursors, cid) do
-      {:ok, entries} ->
-        {taken, rest} = Enum.split(entries, Map.get(request, "max_count", 0))
+    case {Map.fetch(state.cursors, cid), Map.get(request, "max_count", 0)} do
+      {{:ok, entries}, count} when is_integer(count) and count >= 0 ->
+        {taken, rest} = Enum.split(entries, count)
         response = %{"type" => "fetch_cursor", "entries" => taken, "done" => rest == []}
         {{:ok, response}, %{state | cursors: Map.put(state.cursors, cid, rest)}}
 
-      :error ->
+      {{:ok, _entries}, _bad_count} ->
+        {{:error, encode(Error.bad_request("max_count must be a non-negative integer"))}, state}
+
+      {:error, _count} ->
         {{:error, encode(error("cursor #{cid} not found", "CURSOR_NOT_FOUND"))}, state}
     end
   end
@@ -343,9 +359,16 @@ defmodule Filo.Socket do
        when type in ~w(execute batch sequence describe get_autocommit) do
     case Map.fetch(state.streams, sid) do
       {:ok, conn} ->
-        inner = request |> Map.delete("stream_id") |> resolve_sql(state.sqls)
-        {_status, stream_result} = Request.handle(state.executor, conn, inner, rows_opt(state))
-        {from_stream_result(stream_result), state}
+        case Error.guard(fn -> request |> Map.delete("stream_id") |> resolve_sql(state.sqls) end) do
+          {:ok, inner} ->
+            {_status, stream_result} =
+              Request.handle(state.executor, conn, inner, rows_opt(state))
+
+            {from_stream_result(stream_result), state}
+
+          {:error, %Error{} = error} ->
+            {{:error, encode(error)}, state}
+        end
 
       :error ->
         {{:error, encode(error("stream #{sid} not found", "STREAM_NOT_FOUND"))}, state}
@@ -353,7 +376,13 @@ defmodule Filo.Socket do
   end
 
   defp handle_request(%{"type" => type}, state) do
-    {{:error, encode(error("unsupported request: #{type}", "FILO_UNSUPPORTED"))}, state}
+    name = if is_binary(type), do: type, else: inspect(type)
+    {{:error, encode(error("unsupported request: #{name}", "FILO_UNSUPPORTED"))}, state}
+  end
+
+  # Not an object with a type at all (e.g. `"request": 5`): answer it, don't crash the socket.
+  defp handle_request(_request, state) do
+    {{:error, encode(Error.bad_request("request must be an object with a type"))}, state}
   end
 
   # Drop (and flush) the owner monitor for a stream that closed normally, so a later

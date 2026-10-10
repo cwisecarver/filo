@@ -26,8 +26,14 @@ defmodule Filo.BatchCond do
 
   @doc "Decodes a Hrana `BatchCond` map into a tagged condition term."
   @spec decode(map()) :: t()
-  def decode(%{"type" => "ok", "step" => step}), do: {:ok, step}
-  def decode(%{"type" => "error", "step" => step}), do: {:error, step}
+  # `step` is validated here, not at `eval/3`: a non-integer index would otherwise raise in the
+  # middle of a running batch (after earlier steps already executed).
+  def decode(%{"type" => "ok", "step" => step}) when is_integer(step) and step >= 0,
+    do: {:ok, step}
+
+  def decode(%{"type" => "error", "step" => step}) when is_integer(step) and step >= 0,
+    do: {:error, step}
+
   def decode(%{"type" => "not", "cond" => cond}), do: {:not, decode(cond)}
   def decode(%{"type" => "and", "conds" => conds}), do: {:and, Enum.map(conds, &decode/1)}
   def decode(%{"type" => "or", "conds" => conds}), do: {:or, Enum.map(conds, &decode/1)}
