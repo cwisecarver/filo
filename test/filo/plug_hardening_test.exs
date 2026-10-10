@@ -167,4 +167,32 @@ defmodule Filo.PlugHardeningTest do
       end
     end
   end
+
+  # H7 (fathom panel2 2026-10-10): the 8 MB constant was passed as read_body's per-call length, but
+  # `{:more, ...}` was looped on with a growing accumulator, so it bounded each read, not the body.
+  # Invariant: a body over the cap is a 413 with a Hrana-shaped error, before auth and the stream.
+  describe "body cap" do
+    test "an oversized JSON body is 413 and never reaches the executor", %{key: key} do
+      opts = plug_opts(key, max_body: 1_000, authorize: fn _arg, _token -> flunk("authorized") end)
+      big = Jason.encode!(%{"requests" => [exec_req(String.duplicate("x", 5_000))]})
+
+      conn = post(opts, "/v3/pipeline", big)
+      assert conn.status == 413
+      assert %{"message" => _, "code" => "FILO_BODY_TOO_LARGE"} = decoded(conn)
+      refute_received {:closed, _}
+    end
+
+    test "an oversized protobuf body is 413 too", %{key: key} do
+      opts = plug_opts(key, max_body: 1_000)
+      conn = post(opts, "/v3-protobuf/pipeline", :crypto.strong_rand_bytes(5_000), "application/x-protobuf")
+      assert conn.status == 413
+    end
+
+    test "a body at the cap is accepted", %{key: key} do
+      opts = plug_opts(key, max_body: 1_000)
+      body = Jason.encode!(%{"requests" => [exec_req("SELECT 1")]})
+      assert byte_size(body) < 1_000
+      assert post(opts, "/v3/pipeline", body).status == 200
+    end
+  end
 end

@@ -42,6 +42,9 @@ defmodule Filo.Plug do
     - `:base_url` — value returned in each response's `base_url`. Default `nil`.
     - `:idle_timeout` — per-stream inactivity timeout in ms. Default uses
       `Filo.Stream`'s.
+    - `:max_body` — the request-body cap in bytes, default `8_000_000`. A larger body is
+      refused with `413` and a Hrana-shaped error (code `FILO_BODY_TOO_LARGE`) without being
+      buffered past the cap.
     - `:call_timeout` — how long the plug waits for a stream to answer one request, in ms.
       Default `:infinity`: the executor bounds its own statements (fathom's is 30 s), and a
       shorter plug-side wait would abandon a statement that may still commit while telling the
@@ -66,7 +69,7 @@ defmodule Filo.Plug do
   alias Filo.Protobuf
   alias Filo.Protobuf.Wire
 
-  @max_body 8_000_000
+  @default_max_body 8_000_000
 
   @impl true
   def init(opts) do
@@ -79,6 +82,7 @@ defmodule Filo.Plug do
       base_url: Keyword.get(opts, :base_url),
       idle_timeout: Keyword.get(opts, :idle_timeout),
       call_timeout: Keyword.get(opts, :call_timeout, :infinity),
+      max_body: Keyword.get(opts, :max_body, @default_max_body),
       # Per-stream process policy, forwarded verbatim to Filo.Stream.start_link/1 (fathom expert
       # review 2026-07-24 #22). A stream is idle-dominant and long-lived, so the host may want a
       # hibernation / GC policy; filo has no opinion, it just stops dropping the options.
@@ -91,7 +95,24 @@ defmodule Filo.Plug do
     if websocket_upgrade?(conn) do
       upgrade(conn, opts)
     else
-      route(conn, opts)
+      conn |> put_private(:filo_max_body, opts.max_body) |> route_capped(opts)
+    end
+  end
+
+  # `read_all/2` throws when the body outgrows the cap, from however deep in a handler it is.
+  defp route_capped(conn, opts) do
+    route(conn, opts)
+  catch
+    {:filo_body_too_large, conn} -> body_too_large(conn)
+  end
+
+  defp body_too_large(%Plug.Conn{path_info: [version | _]} = conn) do
+    error = %Error{message: "request body too large", code: "FILO_BODY_TOO_LARGE"}
+
+    if version == "v3-protobuf" do
+      send_protobuf(conn, 413, Protobuf.encode_error(Error.encode(error)))
+    else
+      send_json(conn, 413, Error.encode(error))
     end
   end
 
@@ -638,10 +659,16 @@ defmodule Filo.Plug do
     end
   end
 
+  # `read_body`'s `:length` is the cap on the WHOLE read (the per-chunk size is `:read_length`), and
+  # `{:more, ...}` means the body still had bytes after that many: it is over the cap. The old code
+  # looped on `:more` with a growing accumulator, so the 8 MB constant bounded each chunk, not the
+  # body - an unauthenticated client could stream gigabytes into one request process (fathom
+  # expert review 2026-10-10 panel2 H7). The authorize callback runs after the body is read, so
+  # the cap has to hold here.
   defp read_all(conn, acc) do
-    case read_body(conn, length: @max_body) do
+    case read_body(conn, length: conn.private.filo_max_body) do
       {:ok, chunk, conn} -> {:ok, acc <> chunk, conn}
-      {:more, chunk, conn} -> read_all(conn, acc <> chunk)
+      {:more, _chunk, conn} -> throw({:filo_body_too_large, conn})
       {:error, _reason} -> {:error, conn}
     end
   end
