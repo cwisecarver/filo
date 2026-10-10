@@ -47,7 +47,7 @@ defmodule Filo.Stream do
   @default_idle_timeout 10_000
   @u64_mask 0xFFFFFFFFFFFFFFFF
 
-  defstruct [:executor, :conn, :seq, :idle_timeout, :timer, :owner_ref, :open_error]
+  defstruct [:executor, :conn, :seq, :idle_timeout, :timer, :owner_ref, :open_error, :timer_ref]
 
   @doc """
   Starts a stream.
@@ -239,9 +239,15 @@ defmodule Filo.Stream do
   end
 
   @impl true
-  def handle_info(:expire, state) do
+  def handle_info({:expire, ref}, %{timer_ref: ref} = state) do
     {:stop, :normal, close_conn(state)}
   end
+
+  # A stale expiry: the timer fired while a request was running (or just before it was re-armed),
+  # so its message sat behind that request in the mailbox. The request has since reset the idle
+  # clock; acting on the old message would kill the stream right after acking a baton the client
+  # is about to use (fathom expert review 2026-10-10 panel2 H3). Only the current ref counts.
+  def handle_info({:expire, _stale_ref}, state), do: {:noreply, state}
 
   # The connection's owner died: close the connection and stop, so an orphaned stream
   # never keeps writing into a file the owner's successor may flush/drop from under it.
@@ -313,9 +319,15 @@ defmodule Filo.Stream do
     #
     # Semantics are unchanged: the cancel still happens, it is just not waited on. The only
     # observable difference is that an already-in-flight :expire may still arrive — and
-    # handle_info(:expire, …) already handles that by stopping the stream, which is the documented
-    # re-openable contract. info: false because the cancellation result is never inspected.
+    # handle_info({:expire, ref}, …) ignores an expiry whose ref is no longer current.
+    # info: false because the cancellation result is never inspected.
     if state.timer, do: Process.cancel_timer(state.timer, async: true, info: false)
-    %{state | timer: Process.send_after(self(), :expire, state.idle_timeout)}
+    ref = make_ref()
+
+    %{
+      state
+      | timer: Process.send_after(self(), {:expire, ref}, state.idle_timeout),
+        timer_ref: ref
+    }
   end
 end
