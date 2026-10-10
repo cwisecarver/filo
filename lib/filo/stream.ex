@@ -139,6 +139,15 @@ defmodule Filo.Stream do
     GenServer.call(server, {:run_cursor, seq, batch}, timeout)
   end
 
+  @doc """
+  Asks the stream to close if it is not inside a transaction (`c:Filo.Executor.autocommit?/1`),
+  releasing its connection. A stream in a transaction is left alone - the idle timeout bounds it
+  and the host decides when to give up on it (killing it rolls the transaction back). The client's
+  next request on the baton gets `STREAM_NOT_FOUND` and reopens. Used to drain a node.
+  """
+  @spec drain(GenServer.server()) :: :ok
+  def drain(server), do: GenServer.cast(server, :drain)
+
   @impl true
   def init(opts) do
     executor = Keyword.fetch!(opts, :executor)
@@ -245,6 +254,17 @@ defmodule Filo.Stream do
 
       {:error, %Error{} = error} ->
         {:reply, {:error, error}, state}
+    end
+  end
+
+  @impl true
+  def handle_cast(:drain, %{conn: nil} = state), do: {:noreply, state}
+
+  def handle_cast(:drain, state) do
+    if state.executor.autocommit?(state.conn) do
+      {:stop, :normal, close_conn(state)}
+    else
+      {:noreply, state}
     end
   end
 

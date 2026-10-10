@@ -87,6 +87,18 @@ defmodule Filo.Streams do
     end
   end
 
+  @doc """
+  Drains every live stream: each one not inside a transaction closes (see `Filo.Stream.drain/1`).
+  Streams inside a transaction stay until they finish, idle out, or the host stops them.
+  """
+  @spec drain(Supervisor.supervisor()) :: :ok
+  def drain(name) do
+    for pid <- Registry.select(registry(name), [{{:_, :"$1", :_}, [], [:"$1"]}]),
+        do: Filo.Stream.drain(pid)
+
+    :ok
+  end
+
   defp registry(name), do: Module.concat(name, Registry)
   defp dynsup(name), do: Module.concat(name, DynamicSupervisor)
   defp via(registry, stream_id), do: {:via, Registry, {registry, stream_id}}

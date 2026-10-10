@@ -30,6 +30,30 @@ defmodule Filo.Socket do
   `Filo.Batch`, `Filo.Request`, …) — only the framing and stream bookkeeping are
   WebSocket specific. Unlike the HTTP binding there are no batons: the persistent
   socket plus the client-allocated `stream_id` identify a stream.
+
+  ## Idle bounds
+
+    - **Hello timeout** (`:hello_timeout`, default 10 s): a socket that has not completed the
+      `hello` handshake by then is closed (1008). Without it an unauthenticated connection could
+      sit open forever.
+    - **Idle-in-transaction** (`:txn_idle_timeout`, default 30 s): a stream that has been idle
+      that long *and* is inside a transaction (`c:Filo.Executor.autocommit?/1` is `false`) is
+      closed - its connection released through `c:Filo.Executor.close/1`, which rolls the
+      transaction back - so an abandoned `BEGIN` cannot hold the database's write lock forever.
+      The client's next request on that `stream_id` gets `STREAM_NOT_FOUND`. A stream idle in
+      autocommit mode is left alone (that is the normal state of a pooled connection). Pass
+      `:infinity` to either option to disable it.
+
+  ## Server-initiated close
+
+  The embedding app can ask a socket to go away, e.g. while draining a node. The socket process is
+  the process that runs `c:Filo.Executor.open/1` for its streams, so an executor can record
+  `self()` there. Then:
+
+    - `drain/1` - graceful: if no stream is inside a transaction the socket closes at once with
+      WebSocket code 1001 ("going away"); otherwise it closes as soon as every stream has left its
+      transaction (checked after each request).
+    - `close/1` - forced: close with 1001 now, releasing (rolling back) every stream.
   """
 
   @behaviour WebSock
@@ -54,6 +78,13 @@ defmodule Filo.Socket do
     # Held for the life of the connection and threaded to EVERY stream's open — so a per-connection
     # credential (e.g. a read-only scope) applies to the 2nd stream, not just the first.
     :open_context,
+    :hello_timer,
+    :sweep_ref,
+    hello_timeout: 10_000,
+    txn_idle_timeout: 30_000,
+    # stream_id => monotonic ms of its last request (for the idle-in-transaction sweep).
+    last_active: %{},
+    draining?: false,
     encoding: :json,
     hello?: false,
     streams: %{},
@@ -79,6 +110,9 @@ defmodule Filo.Socket do
   field), and `:header_token` (a bearer token the host extracted from the
   upgrade request, the fallback when the hello carries no `jwt`).
 
+  `:hello_timeout` (default `10_000` ms) and `:txn_idle_timeout` (default `30_000` ms) bound a
+  silent socket and an abandoned transaction - see "Idle bounds" in the module docs.
+
   Per-connection resource caps (all optional, generous defaults; override only for
   unusual workloads): `:max_sqls` (stored-statement count, default #{@default_max_sqls}),
   `:max_sql_bytes` (total stored-SQL bytes, default #{@default_max_sql_bytes}), and
@@ -95,11 +129,41 @@ defmodule Filo.Socket do
       encoding: Keyword.get(opts, :encoding, :json),
       max_sqls: Keyword.get(opts, :max_sqls, @default_max_sqls),
       max_sql_bytes: Keyword.get(opts, :max_sql_bytes, @default_max_sql_bytes),
-      max_cursors: Keyword.get(opts, :max_cursors, @default_max_cursors)
+      max_cursors: Keyword.get(opts, :max_cursors, @default_max_cursors),
+      hello_timeout: Keyword.get(opts, :hello_timeout, 10_000),
+      txn_idle_timeout: Keyword.get(opts, :txn_idle_timeout, 30_000)
     }
 
-    {:ok, state}
+    {:ok, arm_hello_timer(state)}
   end
+
+  @doc """
+  Asks the socket process `pid` to close gracefully (WebSocket 1001): at once if no stream is in a
+  transaction, otherwise as soon as none is. See "Server-initiated close" in the module docs.
+  """
+  @spec drain(pid()) :: :ok
+  def drain(pid) when is_pid(pid) do
+    send(pid, :filo_drain)
+    :ok
+  end
+
+  @doc """
+  Asks the socket process `pid` to close now (WebSocket 1001), releasing - and so rolling back -
+  every stream. See "Server-initiated close" in the module docs.
+  """
+  @spec close(pid()) :: :ok
+  def close(pid) when is_pid(pid) do
+    send(pid, :filo_close)
+    :ok
+  end
+
+  defp arm_hello_timer(%{hello_timeout: :infinity} = state), do: state
+
+  defp arm_hello_timer(state),
+    do: %{
+      state
+      | hello_timer: Process.send_after(self(), :filo_hello_timeout, state.hello_timeout)
+    }
 
   @impl true
   def handle_in({text, [opcode: :text]}, %{encoding: :json} = state) do
@@ -156,12 +220,103 @@ defmodule Filo.Socket do
       {sid, owners} ->
         {conn, streams} = Map.pop(state.streams, sid)
         if conn, do: state.executor.close(conn)
-        {:ok, %{state | streams: streams, owners: owners}}
+
+        {:ok,
+         %{
+           state
+           | streams: streams,
+             owners: owners,
+             last_active: Map.delete(state.last_active, sid)
+         }}
     end
   end
 
-  # Filo never sends itself other process messages — it only replies to client frames.
+  # No hello by the deadline: close. (A timer that outlived a completed hello is ignored.)
+  def handle_info(:filo_hello_timeout, %{hello?: false} = state),
+    do: {:stop, :normal, {1008, "hello timeout"}, state}
+
+  def handle_info(:filo_hello_timeout, state), do: {:ok, state}
+
+  # Idle-in-transaction sweep: see sweep/1.
+  def handle_info(:filo_txn_sweep, state), do: {:ok, sweep(%{state | sweep_ref: nil})}
+
+  def handle_info(:filo_drain, state) do
+    if in_transaction?(state) do
+      {:ok, %{state | draining?: true}}
+    else
+      {:stop, :normal, {1001, "going away"}, state}
+    end
+  end
+
+  def handle_info(:filo_close, state), do: {:stop, :normal, {1001, "going away"}, state}
+
+  # Anything else is not Filo's: ignore it.
   def handle_info(_message, state), do: {:ok, state}
+
+  defp in_transaction?(state),
+    do: Enum.any?(state.streams, fn {_sid, conn} -> not state.executor.autocommit?(conn) end)
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
+
+  # Records that `request`'s stream was just used, and makes sure a sweep is scheduled. One timer
+  # per socket (not per stream): idle-dominant sockets cost nothing until they next do something.
+  defp touch(%{txn_idle_timeout: :infinity} = state, _request), do: state
+
+  defp touch(state, %{"stream_id" => sid}) do
+    if Map.has_key?(state.streams, sid) do
+      arm_sweep(%{state | last_active: Map.put(state.last_active, sid, now_ms())})
+    else
+      state
+    end
+  end
+
+  defp touch(state, _request), do: state
+
+  defp arm_sweep(%{sweep_ref: nil} = state),
+    do: %{state | sweep_ref: Process.send_after(self(), :filo_txn_sweep, state.txn_idle_timeout)}
+
+  defp arm_sweep(state), do: state
+
+  # Releases every stream idle for `:txn_idle_timeout` that is still inside a transaction (closing
+  # the connection rolls it back). Streams idle in autocommit are only forgotten: they cost the
+  # database nothing, and the next request re-tracks them. Re-arms for the earliest not-yet-due one.
+  defp sweep(state) do
+    now = now_ms()
+
+    {due, pending} =
+      Enum.split_with(state.last_active, fn {_sid, at} -> now - at >= state.txn_idle_timeout end)
+
+    state = %{state | last_active: Map.new(pending)}
+    state = Enum.reduce(due, state, fn {sid, _at}, acc -> release_if_in_transaction(acc, sid) end)
+
+    case pending do
+      [] ->
+        state
+
+      _ ->
+        wait =
+          pending
+          |> Enum.map(fn {_sid, at} -> state.txn_idle_timeout - (now - at) end)
+          |> Enum.min()
+
+        %{state | sweep_ref: Process.send_after(self(), :filo_txn_sweep, max(wait, 1))}
+    end
+  end
+
+  defp release_if_in_transaction(state, sid) do
+    case Map.fetch(state.streams, sid) do
+      {:ok, conn} ->
+        if state.executor.autocommit?(conn) do
+          state
+        else
+          state.executor.close(conn)
+          %{state | streams: Map.delete(state.streams, sid), owners: forget(state.owners, sid)}
+        end
+
+      :error ->
+        state
+    end
+  end
 
   @impl true
   def terminate(_reason, state) do
@@ -181,6 +336,9 @@ defmodule Filo.Socket do
         # Capture the verified context once, at hello, and hold it for the whole connection —
         # every later open_stream threads it, so a per-connection scope can't be escalated away
         # after the first stream.
+        if state.hello_timer,
+          do: Process.cancel_timer(state.hello_timer, async: true, info: false)
+
         push(%{"type" => "hello_ok"}, %{state | hello?: true, open_context: context})
 
       {:error, %Error{} = error} ->
@@ -200,17 +358,33 @@ defmodule Filo.Socket do
 
   defp handle_message(%{"type" => "request", "request_id" => id, "request" => request}, state) do
     {outcome, state} = handle_request(request, state)
+    state = touch(state, request)
 
-    case outcome do
-      {:ok, response} ->
-        push(%{"type" => "response_ok", "request_id" => id, "response" => response}, state)
+    reply =
+      case outcome do
+        {:ok, response} ->
+          push(%{"type" => "response_ok", "request_id" => id, "response" => response}, state)
 
-      {:error, error_map} ->
-        push(%{"type" => "response_error", "request_id" => id, "error" => error_map}, state)
-    end
+        {:error, error_map} ->
+          push(%{"type" => "response_error", "request_id" => id, "error" => error_map}, state)
+      end
+
+    finish_drain(reply)
   end
 
   defp handle_message(_unknown, state), do: {:stop, :normal, state}
+
+  # A draining socket (see drain/1) closes, 1001, once its last transaction has ended - after the
+  # response to the request that ended it has been pushed.
+  defp finish_drain({:push, frame, %{draining?: true} = state}) do
+    if in_transaction?(state) do
+      {:push, frame, state}
+    else
+      {:stop, :normal, {1001, "going away"}, [frame], state}
+    end
+  end
+
+  defp finish_drain(reply), do: reply
 
   defp handle_request(%{"type" => "open_stream", "stream_id" => sid}, state) do
     if Map.has_key?(state.streams, sid) do
@@ -243,7 +417,12 @@ defmodule Filo.Socket do
         state.executor.close(conn)
 
         {{:ok, %{"type" => "close_stream"}},
-         %{state | streams: streams, owners: forget(state.owners, sid)}}
+         %{
+           state
+           | streams: streams,
+             owners: forget(state.owners, sid),
+             last_active: Map.delete(state.last_active, sid)
+         }}
     end
   end
 

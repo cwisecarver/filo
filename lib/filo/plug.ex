@@ -45,6 +45,8 @@ defmodule Filo.Plug do
     - `:max_body` — the request-body cap in bytes, default `8_000_000`. A larger body is
       refused with `413` and a Hrana-shaped error (code `FILO_BODY_TOO_LARGE`) without being
       buffered past the cap.
+    - `:hello_timeout`, `:txn_idle_timeout` — WebSocket idle bounds (defaults 10 s and 30 s,
+      `:infinity` disables); see `Filo.Socket`.
     - `:call_timeout` — how long the plug waits for a stream to answer one request, in ms.
       Default `:infinity`: the executor bounds its own statements (fathom's is 30 s), and a
       shorter plug-side wait would abandon a statement that may still commit while telling the
@@ -83,6 +85,7 @@ defmodule Filo.Plug do
       idle_timeout: Keyword.get(opts, :idle_timeout),
       call_timeout: Keyword.get(opts, :call_timeout, :infinity),
       max_body: Keyword.get(opts, :max_body, @default_max_body),
+      socket_opts: Keyword.take(opts, [:hello_timeout, :txn_idle_timeout]),
       # Per-stream process policy, forwarded verbatim to Filo.Stream.start_link/1 (fathom expert
       # review 2026-07-24 #22). A stream is idle-dominant and long-lived, so the host may want a
       # hibernation / GC policy; filo has no opinion, it just stops dropping the options.
@@ -158,16 +161,19 @@ defmodule Filo.Plug do
   defp upgrade(conn, opts) do
     {conn, encoding} = negotiate_subprotocol(conn)
 
-    socket_opts = [
-      executor: opts.executor,
-      open_arg: open_arg(opts, conn),
-      encoding: encoding,
-      # Auth on the WS binding happens at the Hrana hello (the token rides the hello's
-      # `jwt` field, which no plug can see); hand the socket the callback plus any
-      # bearer token the upgrade request did carry, as the hello-jwt fallback.
-      authorize: opts.authorize,
-      header_token: bearer_token(conn)
-    ]
+    # Socket idle bounds: forwarded only when configured, so Filo.Socket's defaults apply otherwise.
+    socket_opts =
+      [
+        executor: opts.executor,
+        open_arg: open_arg(opts, conn),
+        encoding: encoding,
+        # Auth on the WS binding happens at the Hrana hello (the token rides the hello's
+        # `jwt` field, which no plug can see); hand the socket the callback plus any
+        # bearer token the upgrade request did carry, as the hello-jwt fallback.
+        authorize: opts.authorize,
+        header_token: bearer_token(conn)
+      ] ++
+        opts.socket_opts
 
     conn
     |> Plug.Conn.upgrade_adapter(:websocket, {Filo.Socket, socket_opts, []})
