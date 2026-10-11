@@ -78,6 +78,15 @@ defmodule Filo.IdleBoundsTest do
     state
   end
 
+  # The sweep timer is armed by the stream's FIRST request (open_stream), so the first sweep can
+  # fire before the latest request is a full window old; the socket then correctly re-arms for the
+  # remainder. Handle sweeps until the socket stops re-arming, so the test never races that gap.
+  defp sweep_until_idle(state) do
+    assert_receive :filo_txn_sweep, 1_000
+    {:ok, state} = Socket.handle_info(:filo_txn_sweep, state)
+    if state.sweep_ref, do: sweep_until_idle(state), else: state
+  end
+
   describe "hello timeout" do
     test "init arms it and a socket with no hello is closed 1008", %{agent: agent} do
       state = socket(agent, hello_timeout: 5)
@@ -97,11 +106,8 @@ defmodule Filo.IdleBoundsTest do
   # database's write lock until the socket died. Invariant: idle + in transaction => released.
   describe "idle in transaction" do
     test "an idle stream in a transaction is closed and its id is gone", %{agent: agent} do
-      state = ready(agent, txn_idle_timeout: 5) |> begin_txn()
-      assert_receive :filo_txn_sweep, 1_000
-
-      {:ok, state} = Socket.handle_info(:filo_txn_sweep, state)
-      assert_receive {:closed, _ref}
+      state = ready(agent, txn_idle_timeout: 5) |> begin_txn() |> sweep_until_idle()
+      assert_received {:closed, _ref}
 
       {resp, _} = pushed(run(state, 3, "SELECT 1"))
       assert resp["type"] == "response_error"
@@ -111,9 +117,7 @@ defmodule Filo.IdleBoundsTest do
     test "an idle stream in autocommit mode is left open", %{agent: agent} do
       state = ready(agent, txn_idle_timeout: 5)
       {_, state} = pushed(run(state, 2, "SELECT 1"))
-      assert_receive :filo_txn_sweep, 1_000
-
-      {:ok, state} = Socket.handle_info(:filo_txn_sweep, state)
+      state = sweep_until_idle(state)
       refute_received {:closed, _}
       {resp, _} = pushed(run(state, 3, "SELECT 1"))
       assert resp["type"] == "response_ok"
