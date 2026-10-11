@@ -7,10 +7,12 @@ Filo uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 version is below `1.0.0`, the **minor** number carries breaking changes as well as
 features; patch releases stay backward compatible.
 
-## [Unreleased]
+## [0.4.0] — 2026-10-10
 
 Fixes and additions from fathom's 2026-10-10 expert review (second panel). No
-breaking changes; no new required `Filo.Executor` callback.
+API is removed and no new `Filo.Executor` callback is required, but some defaults
+change behaviour (stream call timeout, request-body cap, WebSocket hello and
+idle-in-transaction timeouts), so this is a minor release.
 
 ### Fixed
 
