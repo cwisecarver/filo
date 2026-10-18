@@ -54,6 +54,10 @@ defmodule Filo.Plug do
       connection closed once the in-flight request returns) and the request answers `504`
       with code `FILO_STREAM_TIMEOUT` — distinct from the `400` `STREAM_NOT_FOUND` of a
       stream that is merely gone.
+    - `:inline_oneshot` — run a baton-less pipeline that contains a `close` in the request process
+      instead of a `Filo.Stream` process (default `true`; only when `:call_timeout` is
+      `:infinity`). The response is identical (`baton: null`); it just skips the stream's
+      process, registry and supervisor round trips.
 
   ## Pipeline flow
 
@@ -87,6 +91,8 @@ defmodule Filo.Plug do
 
   import Plug.Conn
 
+  require Logger
+
   alias Filo.{Baton, Batch, BatchResult, Cursor, Error, Stmt, StmtResult, Stream, Streams}
   alias Filo.Protobuf
   alias Filo.Protobuf.Wire
@@ -104,6 +110,7 @@ defmodule Filo.Plug do
       base_url: Keyword.get(opts, :base_url),
       idle_timeout: Keyword.get(opts, :idle_timeout),
       call_timeout: Keyword.get(opts, :call_timeout, :infinity),
+      inline_oneshot: Keyword.get(opts, :inline_oneshot, true),
       max_body: Keyword.get(opts, :max_body, @default_max_body),
       socket_opts: Keyword.take(opts, [:hello_timeout, :txn_idle_timeout]),
       # Per-stream process policy, forwarded verbatim to Filo.Stream.start_link/1 (fathom expert
@@ -306,12 +313,16 @@ defmodule Filo.Plug do
     arg = open_arg(opts, conn)
 
     with {:ok, context} <- authorize(opts, arg, bearer_token(conn)) do
-      case Streams.create(opts.streams, new_stream_opts(opts, arg, context)) do
-        {:ok, stream_id, seq, pid} ->
-          run(opts, stream_id, pid, seq, requests, enc_opts)
+      if inline_oneshot?(opts, requests) do
+        run_inline(opts, arg, context, requests, enc_opts)
+      else
+        case Streams.create(opts.streams, new_stream_opts(opts, arg, context)) do
+          {:ok, stream_id, seq, pid} ->
+            run(opts, stream_id, pid, seq, requests, enc_opts)
 
-        {:error, reason} ->
-          open_failed_response(reason)
+          {:error, reason} ->
+            open_failed_response(reason)
+        end
       end
     end
   end
@@ -329,6 +340,80 @@ defmodule Filo.Plug do
   # the request on a function clause (fathom expert review 2026-10-10 panel2 H8).
   defp dispatch(_opts, _conn, _baton, _requests, _enc_opts) do
     {:error, 400, Error.bad_request("baton must be a string and requests a list")}
+  end
+
+  # ONE-SHOT PIPELINES RUN IN THE REQUEST PROCESS (fathom expert review 2026-10-17 #9). A request
+  # with no baton whose pipeline contains a `close` can never be resumed: the stream is closed
+  # before the response is sent and the response baton is `null`. Starting a `Filo.Stream` process
+  # for it (Registry lookup, random ids, a `DynamicSupervisor.start_child` behind one supervisor,
+  # register, continue, two more call hops, an idle timer, then a stop) buys nothing but a
+  # mailbox for a client that cannot come back - the v1 endpoints already open, run and close inline
+  # (`with_conn/3`). The result, error shapes and baton (`null`) are identical.
+  #
+  # Only when `:call_timeout` is `:infinity` (the default): the stream process exists to bound a
+  # statement with a caller-side timeout, which an inline run cannot do, so a host that set one
+  # keeps the process. `:inline_oneshot` (default true) turns it off.
+  defp inline_oneshot?(%{call_timeout: :infinity} = opts, requests),
+    do: Map.get(opts, :inline_oneshot, true) and Enum.any?(requests, &close_request?/1)
+
+  defp inline_oneshot?(_opts, _requests), do: false
+
+  defp close_request?(%{"type" => "close"}), do: true
+  defp close_request?(_), do: false
+
+  defp run_inline(opts, arg, context, requests, enc_opts) do
+    case open_inline(opts, arg, context) do
+      {:ok, db} ->
+        try do
+          {_status, results} = run_inline_pipeline(opts.executor, db, requests, enc_opts)
+          {:ok, nil, results}
+        catch
+          kind, reason ->
+            # What the stream process did for a crash: terminate/2 closed the connection and the
+            # plug answered STREAM_NOT_FOUND. Log it, as the crashing GenServer would have.
+            _ = safe_close(opts.executor, db)
+
+            Logger.error(
+              "Filo.Plug one-shot pipeline crashed: " <>
+                Exception.format(kind, reason, __STACKTRACE__)
+            )
+
+            {:error, 400, %Error{message: "stream not found", code: "STREAM_NOT_FOUND"}}
+        end
+
+      {:error, reason} ->
+        open_failed_response(reason)
+    end
+  end
+
+  defp open_inline(opts, arg, context) do
+    case Filo.Executor.open(opts.executor, arg, context) do
+      {:ok, db} -> {:ok, db}
+      {:error, error} -> {:error, {:open_failed, error}}
+    end
+  catch
+    _kind, _reason -> {:error, :open_crashed}
+  end
+
+  # The same reduce `Filo.Stream.run_pipeline/3` runs: results in order, halting at `close`.
+  defp run_inline_pipeline(executor, db, requests, enc_opts) do
+    {status, acc} =
+      Enum.reduce_while(requests, {:open, []}, fn request, {_status, acc} ->
+        {status, result} = Filo.Request.handle(executor, db, request, enc_opts)
+
+        case status do
+          :open -> {:cont, {:open, [result | acc]}}
+          :closed -> {:halt, {:closed, [result | acc]}}
+        end
+      end)
+
+    {status, Enum.reverse(acc)}
+  end
+
+  defp safe_close(executor, db) do
+    executor.close(db)
+  catch
+    _kind, _reason -> :error
   end
 
   defp run(opts, stream_id, pid, seq, requests, enc_opts) do

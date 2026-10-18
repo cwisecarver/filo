@@ -52,21 +52,35 @@ defmodule Filo.Streams do
   """
   @spec create(Supervisor.supervisor(), keyword()) ::
           {:ok, non_neg_integer(), non_neg_integer(), pid()} | {:error, term()}
-  def create(name, stream_opts) do
+  def create(name, stream_opts), do: create(name, stream_opts, 10)
+
+  # ONE `:crypto.strong_rand_bytes/1` for id and seq, and no Registry pre-lookup (fathom expert
+  # review 2026-10-17 #9): registering the via-name is itself the uniqueness check, so a (vanishingly
+  # unlikely) collision with a live stream surfaces as `{:already_started, _}` from `start_child` and
+  # draws a new id, instead of every create paying a lookup first.
+  defp create(_name, _stream_opts, 0),
+    do: raise("Filo.Streams: could not generate a free stream id")
+
+  defp create(name, stream_opts, attempts) do
     registry = registry(name)
-    stream_id = gen_stream_id(registry)
-    seq = rand_u64()
+    <<stream_id::unsigned-64, seq::unsigned-64>> = :crypto.strong_rand_bytes(2 * @u64_bytes)
 
     opts =
       Keyword.merge(stream_opts, seq: seq, name: via(registry, stream_id), deferred_open: true)
 
-    # The executor open runs in the stream process, and THIS caller waits for it — not the shared
+    # The executor open runs in the stream process, and THIS caller waits for it - not the shared
     # DynamicSupervisor, which used to block every other create on the node behind one slow open
     # (fathom expert review 2026-10-01 #2). The contract is unchanged: `create/2` returns once the
     # connection is open, or with `{:error, {:open_failed, error}}`.
-    with {:ok, pid} <- DynamicSupervisor.start_child(dynsup(name), {Filo.Stream, opts}),
-         :ok <- await_open(pid) do
-      {:ok, stream_id, seq, pid}
+    case DynamicSupervisor.start_child(dynsup(name), {Filo.Stream, opts}) do
+      {:ok, pid} ->
+        with :ok <- await_open(pid), do: {:ok, stream_id, seq, pid}
+
+      {:error, {:already_started, _pid}} ->
+        create(name, stream_opts, attempts - 1)
+
+      {:error, _} = error ->
+        error
     end
   end
 
@@ -102,19 +116,4 @@ defmodule Filo.Streams do
   defp registry(name), do: Module.concat(name, Registry)
   defp dynsup(name), do: Module.concat(name, DynamicSupervisor)
   defp via(registry, stream_id), do: {:via, Registry, {registry, stream_id}}
-
-  # Random unguessable u64 id, rejection-sampled against the registry to avoid a
-  # (vanishingly unlikely) collision with a live stream.
-  defp gen_stream_id(registry) do
-    Enum.find_value(1..10, fn _ ->
-      id = rand_u64()
-
-      case Registry.lookup(registry, id) do
-        [] -> id
-        _ -> nil
-      end
-    end) || raise "Filo.Streams: could not generate a free stream id"
-  end
-
-  defp rand_u64, do: :binary.decode_unsigned(:crypto.strong_rand_bytes(@u64_bytes))
 end
