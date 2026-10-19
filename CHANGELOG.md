@@ -7,6 +7,24 @@ Filo uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 version is below `1.0.0`, the **minor** number carries breaking changes as well as
 features; patch releases stay backward compatible.
 
+## [0.4.1] — 2026-10-18
+
+Performance only. No API is removed, no `Filo.Executor` callback changes, and
+responses are byte-for-byte identical, so this is a patch release.
+
+### Changed
+
+- **One-shot pipelines run in the request process.** A v2/v3 request with no
+  baton whose pipeline contains a `close` can never be resumed, so `Filo.Plug`
+  now opens, runs and closes it inline instead of starting a `Filo.Stream`
+  process for it (as the v1 endpoints already did). Measured in fathom: one-shot
+  and pooled-open round trips about 16% faster. Applies only while
+  `:call_timeout` is `:infinity` (the default); the new `:inline_oneshot`
+  option (default `true`) turns it off.
+- **Stream creation is cheaper.** `Filo.Streams.create/2` draws the stream id and
+  seq from one `:crypto.strong_rand_bytes/1` call and relies on via-name
+  registration for uniqueness instead of a Registry pre-lookup.
+
 ## [0.4.0] — 2026-10-10
 
 Fixes and additions from fathom's 2026-10-10 expert review (second panel). No
