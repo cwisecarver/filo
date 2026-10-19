@@ -40,12 +40,13 @@ defmodule Filo.Batch do
   """
   @spec run(t(), exec_fun(), autocommit_fun()) :: BatchResult.t()
   def run(%__MODULE__{steps: steps}, exec_fun, autocommit_fun) do
-    {results, errors, _outcomes} =
-      Enum.reduce(steps, {[], [], []}, fn %{condition: condition, stmt: stmt},
-                                          {results, errors, outcomes} ->
-        run? =
-          condition == nil or
-            BatchCond.eval(condition, Enum.reverse(outcomes), autocommit_fun.())
+    # Outcomes live in a step-index map so a condition's prior-step lookup is O(1); the old
+    # per-step Enum.reverse(outcomes) + Enum.at made N conditioned steps O(N^2)
+    # (expert review 2026-10-19 #13).
+    {results, errors, _outcomes, _next} =
+      Enum.reduce(steps, {[], [], %{}, 0}, fn %{condition: condition, stmt: stmt},
+                                              {results, errors, outcomes, idx} ->
+        run? = condition == nil or BatchCond.eval(condition, outcomes, autocommit_fun.())
 
         {result, error, outcome} =
           if run? do
@@ -57,7 +58,7 @@ defmodule Filo.Batch do
             {nil, nil, :skipped}
           end
 
-        {[result | results], [error | errors], [outcome | outcomes]}
+        {[result | results], [error | errors], Map.put(outcomes, idx, outcome), idx + 1}
       end)
 
     %BatchResult{step_results: Enum.reverse(results), step_errors: Enum.reverse(errors)}

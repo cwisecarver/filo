@@ -39,15 +39,27 @@ defmodule Filo.BatchCond do
   def decode(%{"type" => "or", "conds" => conds}), do: {:or, Enum.map(conds, &decode/1)}
   def decode(%{"type" => "is_autocommit"}), do: :is_autocommit
 
-  @doc """
-  Evaluates a condition. `outcomes` is the list of earlier step outcomes indexed
-  by step number; `autocommit?` is the connection's current autocommit state.
+  @typedoc """
+  Earlier step outcomes: a list indexed by step number, or a map of step number to outcome.
+  `Filo.Batch.run/3` passes the map, so a prior-step lookup is O(1) rather than the list's
+  O(step) walk (fathom expert review 2026-10-19 #13: N conditioned steps were O(N^2)).
   """
-  @spec eval(t(), [outcome()], boolean()) :: boolean()
-  def eval({:ok, step}, outcomes, _autocommit?), do: Enum.at(outcomes, step) == :ok
-  def eval({:error, step}, outcomes, _autocommit?), do: Enum.at(outcomes, step) == :error
+  @type outcomes :: [outcome()] | %{optional(non_neg_integer()) => outcome()}
+
+  @doc """
+  Evaluates a condition. `outcomes` holds the earlier step outcomes (a list indexed by step
+  number, or a step-number => outcome map); a step with no recorded outcome (one that has not
+  run yet) is neither `ok` nor `error`. `autocommit?` is the connection's current autocommit
+  state.
+  """
+  @spec eval(t(), outcomes(), boolean()) :: boolean()
+  def eval({:ok, step}, outcomes, _autocommit?), do: outcome_at(outcomes, step) == :ok
+  def eval({:error, step}, outcomes, _autocommit?), do: outcome_at(outcomes, step) == :error
   def eval({:not, cond}, outcomes, autocommit?), do: not eval(cond, outcomes, autocommit?)
   def eval({:and, conds}, outcomes, ac?), do: Enum.all?(conds, &eval(&1, outcomes, ac?))
   def eval({:or, conds}, outcomes, ac?), do: Enum.any?(conds, &eval(&1, outcomes, ac?))
   def eval(:is_autocommit, _outcomes, autocommit?), do: autocommit?
+
+  defp outcome_at(outcomes, step) when is_map(outcomes), do: Map.get(outcomes, step)
+  defp outcome_at(outcomes, step) when is_list(outcomes), do: Enum.at(outcomes, step)
 end

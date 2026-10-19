@@ -7,6 +7,16 @@ Filo uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 version is below `1.0.0`, the **minor** number carries breaking changes as well as
 features; patch releases stay backward compatible.
 
+## [Unreleased]
+
+### Changed
+
+- **Conditioned batches are linear, not quadratic.** `Filo.Batch.run/3` kept step
+  outcomes in a list and reversed/walked it for every conditioned step, so N
+  conditioned steps cost O(N^2) (N=5000: 32 ms, N=20000: 530 ms; now 0.9 ms and
+  4 ms). Outcomes are now a step-index map. `Filo.BatchCond.eval/3` accepts either
+  form, so existing callers are unaffected; results are identical.
+
 ## [0.4.1] — 2026-10-18
 
 Performance only. No API is removed, no `Filo.Executor` callback changes, and
