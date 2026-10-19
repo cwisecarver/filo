@@ -20,15 +20,23 @@ defmodule Filo.StmtResult do
           affected_row_count: non_neg_integer(),
           last_insert_rowid: integer() | nil,
           rows_read: non_neg_integer(),
-          rows_written: non_neg_integer()
+          rows_written: non_neg_integer(),
+          cols_encoded: cols_encoded() | nil
         }
+
+  @typedoc """
+  Pre-built wire form of a column list, from `encode_cols/1`: the JSON `"cols"` array as a
+  `Jason.Fragment` and the protobuf `StmtResult.cols` fields as a binary.
+  """
+  @type cols_encoded :: %{json: Jason.Fragment.t(), protobuf: binary()}
 
   defstruct cols: [],
             rows: [],
             affected_row_count: 0,
             last_insert_rowid: nil,
             rows_read: 0,
-            rows_written: 0
+            rows_written: 0,
+            cols_encoded: nil
 
   @doc """
   Encodes a `Filo.StmtResult` into a Hrana `StmtResult` map.
@@ -46,15 +54,46 @@ defmodule Filo.StmtResult do
   """
   @spec encode(t(), keyword()) :: map()
   def encode(%__MODULE__{} = result, opts \\ []) do
+    rows_mode = Keyword.get(opts, :rows, :maps)
+
     %{
-      "cols" => Enum.map(result.cols, &encode_col/1),
-      "rows" => encode_rows(result.rows, Keyword.get(opts, :rows, :maps)),
+      "cols" => encode_cols_for(result, rows_mode),
+      "rows" => encode_rows(result.rows, rows_mode),
       "affected_row_count" => result.affected_row_count,
       "last_insert_rowid" => encode_rowid(result.last_insert_rowid),
       "replication_index" => nil,
       "rows_read" => result.rows_read,
       "rows_written" => result.rows_written,
       "query_duration_ms" => 0.0
+    }
+  end
+
+  # When the host supplied `cols_encoded` (see `encode_cols/1`) the JSON / protobuf modes splice
+  # it instead of rebuilding a map per column on every execution (fathom expert review
+  # 2026-10-19 #10). The default :maps mode always builds the maps: its consumers read them.
+  defp encode_cols_for(%__MODULE__{cols_encoded: %{json: json}}, :json), do: json
+
+  defp encode_cols_for(%__MODULE__{cols_encoded: %{protobuf: pb}}, :protobuf),
+    do: {:protobuf_cols, pb}
+
+  defp encode_cols_for(%__MODULE__{cols: cols}, _mode), do: Enum.map(cols, &encode_col/1)
+
+  @doc """
+  Pre-builds the wire form of a column list, for a host that executes the same statement
+  repeatedly (a statement cache): store the result in `:cols_encoded` and `encode/2` splices it
+  in `rows: :json` / `rows: :protobuf` mode instead of re-encoding every column per execution.
+
+  The output is byte-identical to what `encode/2` produces from `cols` alone. The caller owns
+  the cache's validity: `cols_encoded` must come from the same `cols` the struct carries
+  (rebuild it whenever the statement's columns change).
+  """
+  @spec encode_cols([col()]) :: cols_encoded()
+  def encode_cols(cols) when is_list(cols) do
+    maps = Enum.map(cols, &encode_col/1)
+
+    %{
+      json: Jason.Fragment.new(IO.iodata_to_binary(Jason.encode_to_iodata!(maps))),
+      protobuf: Filo.Protobuf.encode_cols(maps)
     }
   end
 

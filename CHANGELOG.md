@@ -9,6 +9,16 @@ features; patch releases stay backward compatible.
 
 ## [Unreleased]
 
+### Added
+
+- **`Filo.StmtResult` accepts precomputed columns.** New optional `:cols_encoded`
+  field, built by `Filo.StmtResult.encode_cols/1` from a column list. When set,
+  `encode/2` in `rows: :json` / `rows: :protobuf` mode splices it instead of
+  rebuilding a map per column on every execution; the output is byte-identical
+  and the default `:maps` mode is unchanged. Meant for hosts that cache a
+  statement's columns (8-column execute response: JSON 12.2 -> 2.7 us,
+  protobuf 3.1 -> 0.65 us). No `Filo.Executor` callback changes.
+
 ### Changed
 
 - **Conditioned batches are linear, not quadratic.** `Filo.Batch.run/3` kept step

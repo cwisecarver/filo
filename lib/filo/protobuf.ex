@@ -108,12 +108,21 @@ defmodule Filo.Protobuf do
   @spec encode_stmt_result(map()) :: iodata()
   def encode_stmt_result(%{} = result) do
     [
-      for(col <- Map.get(result, "cols", []), do: Wire.field_len(1, encode_col(col))),
+      encode_cols(Map.get(result, "cols", [])),
       encode_rows(Map.get(result, "rows", [])),
       uint_field(3, Map.get(result, "affected_row_count", 0)),
       int_field(4, to_int_or_nil(Map.get(result, "last_insert_rowid")), :sint)
     ]
   end
+
+  @doc false
+  # The `cols` fields of a `StmtResult` message; `{:protobuf_cols, binary}` (from
+  # `Filo.StmtResult.encode/2` with a `cols_encoded`) is spliced as is.
+  @spec encode_cols([map() | String.t()] | {:protobuf_cols, binary()}) :: iodata()
+  def encode_cols({:protobuf_cols, encoded}), do: encoded
+
+  def encode_cols(cols) when is_list(cols),
+    do: for(col <- cols, do: Wire.field_len(1, encode_col(col)))
 
   @spec decode_stmt_result(binary()) :: map()
   def decode_stmt_result(bin) do
