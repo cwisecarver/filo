@@ -68,6 +68,8 @@ defmodule Filo.Cursor do
   defp encode_row(row, :json),
     do: Jason.Fragment.new(IO.iodata_to_binary(StmtResult.row_iodata(row)))
 
+  defp encode_row(row, :json_iodata), do: Jason.Fragment.new(StmtResult.row_iodata(row))
+
   defp encode_col(%{name: name, decltype: decltype}),
     do: %{"name" => name, "decltype" => decltype}
 

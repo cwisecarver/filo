@@ -639,7 +639,7 @@ defmodule Filo.Socket do
   # Result-encoder opts by negotiated encoding: each transport takes its rows pre-encoded, so
   # the protobuf one no longer round-trips every cell through strings and base64 (fathom
   # expert review 2026-10-01 #37).
-  defp rows_opt(%{encoding: :json}), do: [rows: :json]
+  defp rows_opt(%{encoding: :json}), do: [rows: :json_iodata]
   defp rows_opt(%{encoding: :protobuf}), do: [rows: :protobuf]
 
   defp stored_sql_bytes(sqls),

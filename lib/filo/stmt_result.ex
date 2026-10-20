@@ -51,6 +51,9 @@ defmodule Filo.StmtResult do
   encoded as protobuf `StmtResult.rows` fields, for the same reason. Only
   `Filo.Protobuf.encode_stmt_result/1` understands it. The default `:maps` gives the
   plain Hrana JSON-term maps.
+
+  `rows: :json_iodata` is `:json` without the flatten: the Fragment holds the row iodata as
+  is. Only for a caller that encodes the result in the same process that consumes it.
   """
   @spec encode(t(), keyword()) :: map()
   def encode(%__MODULE__{} = result, opts \\ []) do
@@ -71,7 +74,9 @@ defmodule Filo.StmtResult do
   # When the host supplied `cols_encoded` (see `encode_cols/1`) the JSON / protobuf modes splice
   # it instead of rebuilding a map per column on every execution (fathom expert review
   # 2026-10-19 #10). The default :maps mode always builds the maps: its consumers read them.
-  defp encode_cols_for(%__MODULE__{cols_encoded: %{json: json}}, :json), do: json
+  defp encode_cols_for(%__MODULE__{cols_encoded: %{json: json}}, mode)
+       when mode in [:json, :json_iodata],
+       do: json
 
   defp encode_cols_for(%__MODULE__{cols_encoded: %{protobuf: pb}}, :protobuf),
     do: {:protobuf_cols, pb}
@@ -102,6 +107,11 @@ defmodule Filo.StmtResult do
 
   defp encode_rows(rows, :json),
     do: Jason.Fragment.new(IO.iodata_to_binary(rows_iodata(rows)))
+
+  # Same-process transports (the WebSocket, the inline one-shot HTTP run) hand the rows to the
+  # same process that writes the socket, so the O(result) flatten that makes the :json mode a
+  # cross-process refc binary is pure extra copying there (fathom expert review 2026-10-20 #31).
+  defp encode_rows(rows, :json_iodata), do: Jason.Fragment.new(rows_iodata(rows))
 
   defp encode_rows(rows, :protobuf), do: {:protobuf_rows, Filo.Protobuf.encode_native_rows(rows)}
 

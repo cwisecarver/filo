@@ -89,7 +89,7 @@ defmodule Filo.Value do
     do: [~S({"type":"integer","value":"), Integer.to_string(v), ~S("})]
 
   def encode_json(v) when is_float(v),
-    do: [~S({"type":"float","value":), Jason.encode_to_iodata!(v), ?}]
+    do: [~S({"type":"float","value":), :erlang.float_to_binary(v, [:short]), ?}]
 
   def encode_json({:blob, v}) when is_binary(v),
     do: [~S({"type":"blob","base64":"), encode_base64(v), ~S("})]

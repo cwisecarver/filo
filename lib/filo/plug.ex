@@ -365,7 +365,9 @@ defmodule Filo.Plug do
     case open_inline(opts, arg, context) do
       {:ok, db} ->
         try do
-          {_status, results} = run_inline_pipeline(opts.executor, db, requests, enc_opts)
+          {_status, results} =
+            run_inline_pipeline(opts.executor, db, requests, inline_enc_opts(enc_opts))
+
           {:ok, nil, results}
         catch
           kind, reason ->
@@ -384,6 +386,14 @@ defmodule Filo.Plug do
       {:error, reason} ->
         open_failed_response(reason)
     end
+  end
+
+  # The inline run encodes in the process that sends the reply, so the rows need no flatten
+  # (expert review 2026-10-20 #31); the baton path keeps :json (refc binary across processes).
+  defp inline_enc_opts(enc_opts) do
+    if Keyword.get(enc_opts, :rows) == :json,
+      do: Keyword.put(enc_opts, :rows, :json_iodata),
+      else: enc_opts
   end
 
   defp open_inline(opts, arg, context) do
