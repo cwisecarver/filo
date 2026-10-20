@@ -7,7 +7,11 @@ Filo uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 version is below `1.0.0`, the **minor** number carries breaking changes as well as
 features; patch releases stay backward compatible.
 
-## [Unreleased]
+## [0.4.2] — 2026-10-19
+
+Performance only. One additive, optional field (`Filo.StmtResult.cols_encoded`) and one
+new function (`Filo.StmtResult.encode_cols/1`); no API is removed, no `Filo.Executor`
+callback changes, and responses are byte-for-byte identical, so this is a patch release.
 
 ### Added
 
