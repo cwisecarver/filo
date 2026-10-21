@@ -35,7 +35,8 @@ defmodule Filo.Streams do
   @impl true
   def init(name) do
     children = [
-      {Registry, keys: :unique, name: registry(name)},
+      # Partitioned (expert review 2026-10-20-2027 #12): same reason as fathom's SessionRegistry.
+      {Registry, keys: :unique, name: registry(name), partitions: System.schedulers_online()},
       {DynamicSupervisor, name: dynsup(name), strategy: :one_for_one}
     ]
 
