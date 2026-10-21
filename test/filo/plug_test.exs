@@ -19,6 +19,37 @@ defmodule Filo.PlugTest.Echo do
   def close(:conn), do: :ok
 end
 
+defmodule Filo.PlugTest.Big do
+  @moduledoc false
+  # A result well past the 32 KiB cursor chunk size, with every value type and cols_encoded.
+  @behaviour Filo.Executor
+
+  @cols [
+    %{name: "i", decltype: "INTEGER"},
+    %{name: "f", decltype: nil},
+    %{name: "t", decltype: "TEXT"},
+    %{name: "b", decltype: "BLOB"},
+    %{name: "n", decltype: nil}
+  ]
+
+  def result do
+    rows =
+      for i <- 1..3000,
+          do: [i * 3_000_000_000_000, i * 0.25, "row \"#{i}\" ünï", <<i::16, 255>>, nil]
+
+    %Filo.StmtResult{cols: @cols, rows: rows, cols_encoded: Filo.StmtResult.encode_cols(@cols)}
+  end
+
+  @impl true
+  def open(_arg), do: {:ok, :conn}
+  @impl true
+  def execute(:conn, %Filo.Stmt{}), do: {:ok, result()}
+  @impl true
+  def autocommit?(:conn), do: true
+  @impl true
+  def close(:conn), do: :ok
+end
+
 defmodule Filo.PlugTest.FailOpen do
   @moduledoc false
   # An executor whose open/1 refuses with a client-error Filo.Error (status 400) — e.g. a missing
@@ -237,6 +268,40 @@ defmodule Filo.PlugTest do
              %{"type" => "row", "row" => [%{"type" => "integer", "value" => "1"}]},
              %{"type" => "step_end", "affected_row_count" => 0}
            ] = entries
+  end
+
+  # The JSON cursor body is encoded in the stream process and written in ~32 KiB chunks; the bytes
+  # must equal the old per-entry Jason encoding of Cursor.entries/2 (expert review 2026-10-21 #20).
+  test "POST /v3/cursor body for a multi-chunk result is byte-identical to the entry encoding" do
+    opts =
+      Filo.Plug.init(
+        executor: Filo.PlugTest.Big,
+        streams: @streams,
+        key: :crypto.strong_rand_bytes(32),
+        base_url: @base_url
+      )
+
+    body = %{"baton" => nil, "batch" => %{"steps" => [%{"stmt" => %{"sql" => "SELECT 1"}}]}}
+
+    conn =
+      conn(:post, "/v3/cursor", Jason.encode!(body))
+      |> put_req_header("content-type", "application/json")
+      |> Filo.Plug.call(opts)
+
+    assert conn.status == 200
+    [head_line, rest] = String.split(conn.resp_body, "\n", parts: 2)
+    assert is_binary(Jason.decode!(head_line)["baton"])
+    assert byte_size(rest) > 3 * 32 * 1024
+
+    br = %Filo.BatchResult{step_results: [Filo.PlugTest.Big.result()], step_errors: [nil]}
+
+    expected =
+      br
+      |> Filo.Cursor.entries(rows: :json)
+      |> Enum.map(fn e -> [Jason.encode_to_iodata!(e), "\n"] end)
+      |> IO.iodata_to_binary()
+
+    assert rest == expected
   end
 
   test "unknown routes are 404", %{opts: opts} do

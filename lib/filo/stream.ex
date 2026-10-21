@@ -130,13 +130,17 @@ defmodule Filo.Stream do
   rotated sequence. Like `run/3`, a mismatched `seq` is `{:error, :baton_reused}`.
   The stream stays open. A batch that cannot be decoded is `{:error, %Filo.Error{}}`
   (`FILO_BAD_REQUEST`) and does not consume the seq.
+
+  With `json_chunk_bytes: n` the stream process instead returns the JSON cursor body already
+  encoded (`Filo.Cursor.json_chunks/2`, a list of ~n-byte binaries), so the reply crosses the
+  process boundary as refc binaries rather than a structural copy of the native rows.
   """
-  @spec run_cursor(GenServer.server(), non_neg_integer(), map(), timeout()) ::
-          {:ok, Filo.BatchResult.t(), non_neg_integer()}
+  @spec run_cursor(GenServer.server(), non_neg_integer(), map(), timeout(), keyword()) ::
+          {:ok, Filo.BatchResult.t() | [binary()], non_neg_integer()}
           | {:error, :baton_reused}
           | {:error, Error.t()}
-  def run_cursor(server, seq, batch, timeout \\ :infinity) do
-    GenServer.call(server, {:run_cursor, seq, batch}, timeout)
+  def run_cursor(server, seq, batch, timeout \\ :infinity, opts \\ []) do
+    GenServer.call(server, {:run_cursor, seq, batch, opts}, timeout)
   end
 
   @doc """
@@ -232,12 +236,12 @@ defmodule Filo.Stream do
     end
   end
 
-  def handle_call({:run_cursor, seq, _batch}, _from, %{seq: expected} = state)
+  def handle_call({:run_cursor, seq, _batch, _opts}, _from, %{seq: expected} = state)
       when seq != expected do
     {:reply, {:error, :baton_reused}, state}
   end
 
-  def handle_call({:run_cursor, _seq, batch}, _from, state) do
+  def handle_call({:run_cursor, _seq, batch, opts}, _from, state) do
     # A malformed batch is answered, not raised: a raise here would kill the stream (and roll
     # back the client's open transaction) over a bad request. The seq is not consumed.
     case Error.guard(fn -> Batch.decode(batch) end) do
@@ -249,8 +253,14 @@ defmodule Filo.Stream do
             fn -> state.executor.autocommit?(state.conn) end
           )
 
+        reply =
+          case Keyword.get(opts, :json_chunk_bytes) do
+            nil -> result
+            bytes -> Filo.Cursor.json_chunks(result, bytes)
+          end
+
         next = state.seq + 1 &&& @u64_mask
-        {:reply, {:ok, result, next}, arm_timer(%{state | seq: next})}
+        {:reply, {:ok, reply, next}, arm_timer(%{state | seq: next})}
 
       {:error, %Error{} = error} ->
         {:reply, {:error, error}, state}

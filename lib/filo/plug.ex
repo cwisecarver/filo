@@ -459,13 +459,16 @@ defmodule Filo.Plug do
     case read_request(conn) do
       {:ok, %{"batch" => batch} = body, conn} ->
         case dispatch_cursor(opts, conn, Map.get(body, "baton"), batch, rows: :json) do
-          {:ok, new_baton, entries} ->
-            head = %{"baton" => new_baton, "base_url" => opts.base_url}
+          {:ok, new_baton, chunks} ->
+            head = [
+              Jason.encode_to_iodata!(%{"baton" => new_baton, "base_url" => opts.base_url}),
+              ?\n
+            ]
 
             conn
             |> put_resp_content_type("text/plain")
             |> send_chunked(200)
-            |> stream_lines([head | entries])
+            |> write_chunks(head, chunks)
 
           {:error, status, %Error{} = error} ->
             send_json(conn, status, Error.encode(error))
@@ -538,28 +541,20 @@ defmodule Filo.Plug do
   # framing boundaries are transport-invisible to the ndjson consumer).
   @cursor_chunk_bytes 32 * 1024
 
-  defp stream_lines(conn, items) do
-    {conn, buf, size} =
-      Enum.reduce(items, {conn, [], 0}, fn item, {conn, buf, size} ->
-        line = [Jason.encode_to_iodata!(item), "\n"]
-        line_size = IO.iodata_length(line)
+  # The stream process already encoded the body into ~@cursor_chunk_bytes binaries; the head line
+  # rides in front of the first so a small cursor is still one transport write.
+  defp write_chunks(conn, head, []) do
+    {:ok, conn} = chunk(conn, head)
+    conn
+  end
 
-        if size + line_size >= @cursor_chunk_bytes do
-          {:ok, conn} = chunk(conn, [buf, line])
-          {conn, [], 0}
-        else
-          {conn, [buf, line], size + line_size}
-        end
-      end)
+  defp write_chunks(conn, head, [first | rest]) do
+    {:ok, conn} = chunk(conn, [head, first])
 
-    case size do
-      0 ->
-        conn
-
-      _ ->
-        {:ok, conn} = chunk(conn, buf)
-        conn
-    end
+    Enum.reduce(rest, conn, fn bin, conn ->
+      {:ok, conn} = chunk(conn, bin)
+      conn
+    end)
   end
 
   defp dispatch_cursor(opts, conn, nil, batch, enc_opts) do
@@ -599,9 +594,12 @@ defmodule Filo.Plug do
   end
 
   defp run_cursor(opts, stream_id, pid, seq, batch, enc_opts) do
-    case Stream.run_cursor(pid, seq, batch, opts.call_timeout) do
+    case Stream.run_cursor(pid, seq, batch, opts.call_timeout, cursor_stream_opts(enc_opts)) do
       {:ok, %BatchResult{} = result, next_seq} ->
         {:ok, Baton.encode(stream_id, next_seq, opts.key), Cursor.entries(result, enc_opts)}
+
+      {:ok, chunks, next_seq} when is_list(chunks) ->
+        {:ok, Baton.encode(stream_id, next_seq, opts.key), chunks}
 
       {:error, %Error{} = error} ->
         {:error, error.status || 400, error}
@@ -611,6 +609,14 @@ defmodule Filo.Plug do
     end
   catch
     :exit, reason -> stream_exit(pid, reason)
+  end
+
+  # JSON cursors are encoded in the stream process (see Stream.run_cursor/5); protobuf keeps the
+  # native BatchResult and its entry maps.
+  defp cursor_stream_opts(enc_opts) do
+    if Keyword.get(enc_opts, :rows) == :json,
+      do: [json_chunk_bytes: @cursor_chunk_bytes],
+      else: []
   end
 
   defp new_stream_opts(opts, arg, context),

@@ -104,6 +104,24 @@ defmodule Filo.StreamTest do
     assert %Filo.StmtResult{rows: [[1]]} = result
   end
 
+  test "run_cursor with json_chunk_bytes returns the body already encoded as binaries" do
+    pid = start_stream(seq: 0)
+    batch = %{"steps" => [%{"stmt" => %{"sql" => "SELECT 1"}}]}
+
+    assert {:ok, chunks, 1} = Stream.run_cursor(pid, 0, batch, :infinity, json_chunk_bytes: 1024)
+    assert Enum.all?(chunks, &is_binary/1)
+
+    assert [
+             %{"type" => "step_begin", "step" => 0},
+             %{"type" => "row", "row" => [%{"type" => "integer", "value" => "1"}]},
+             %{"type" => "step_end"}
+           ] =
+             chunks
+             |> IO.iodata_to_binary()
+             |> String.split("\n", trim: true)
+             |> Enum.map(&Jason.decode!/1)
+  end
+
   test "run_cursor rejects a mismatched seq" do
     pid = start_stream(seq: 5)
 
