@@ -49,16 +49,57 @@ defmodule Filo.BatchCond do
   @doc """
   Evaluates a condition. `outcomes` holds the earlier step outcomes (a list indexed by step
   number, or a step-number => outcome map); a step with no recorded outcome (one that has not
-  run yet) is neither `ok` nor `error`. `autocommit?` is the connection's current autocommit
-  state.
+  run yet) is neither `ok` nor `error`.
+
+  `autocommit?` is the connection's autocommit state: a boolean, or a 0-arity function that
+  reads it. A function is called only when an `is_autocommit` leaf is actually reached, and at
+  most once per `eval/3` call - the flag can only change when a statement runs, so a step's
+  condition sees one value. Hosts whose read is a real dispatch (a NIF call) pay nothing for
+  the ok/error chains that never ask.
   """
-  @spec eval(t(), outcomes(), boolean()) :: boolean()
-  def eval({:ok, step}, outcomes, _autocommit?), do: outcome_at(outcomes, step) == :ok
-  def eval({:error, step}, outcomes, _autocommit?), do: outcome_at(outcomes, step) == :error
-  def eval({:not, cond}, outcomes, autocommit?), do: not eval(cond, outcomes, autocommit?)
-  def eval({:and, conds}, outcomes, ac?), do: Enum.all?(conds, &eval(&1, outcomes, ac?))
-  def eval({:or, conds}, outcomes, ac?), do: Enum.any?(conds, &eval(&1, outcomes, ac?))
-  def eval(:is_autocommit, _outcomes, autocommit?), do: autocommit?
+  @spec eval(t(), outcomes(), boolean() | (-> boolean())) :: boolean()
+  def eval(cond, outcomes, autocommit?) do
+    {result, _ac} = ev(cond, outcomes, autocommit?)
+    result
+  end
+
+  # Threads the autocommit slot (a boolean once read, else the thunk) through the tree so a
+  # lazily-read flag is memoized for the rest of this evaluation.
+  defp ev({:ok, step}, outcomes, ac), do: {outcome_at(outcomes, step) == :ok, ac}
+  defp ev({:error, step}, outcomes, ac), do: {outcome_at(outcomes, step) == :error, ac}
+
+  defp ev({:not, cond}, outcomes, ac) do
+    {result, ac} = ev(cond, outcomes, ac)
+    {not result, ac}
+  end
+
+  defp ev({:and, conds}, outcomes, ac), do: ev_all(conds, outcomes, ac)
+
+  defp ev({:or, conds}, outcomes, ac) do
+    # any(c) == not all(not c); evaluate left to right, stop at the first true.
+    Enum.reduce_while(conds, {false, ac}, fn cond, {_, ac} ->
+      case ev(cond, outcomes, ac) do
+        {true, ac} -> {:halt, {true, ac}}
+        {false, ac} -> {:cont, {false, ac}}
+      end
+    end)
+  end
+
+  defp ev(:is_autocommit, _outcomes, ac) when is_boolean(ac), do: {ac, ac}
+
+  defp ev(:is_autocommit, _outcomes, ac) when is_function(ac, 0) do
+    value = ac.()
+    {value, value}
+  end
+
+  defp ev_all(conds, outcomes, ac) do
+    Enum.reduce_while(conds, {true, ac}, fn cond, {_, ac} ->
+      case ev(cond, outcomes, ac) do
+        {false, ac} -> {:halt, {false, ac}}
+        {true, ac} -> {:cont, {true, ac}}
+      end
+    end)
+  end
 
   defp outcome_at(outcomes, step) when is_map(outcomes), do: Map.get(outcomes, step)
   defp outcome_at(outcomes, step) when is_list(outcomes), do: Enum.at(outcomes, step)

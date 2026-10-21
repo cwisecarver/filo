@@ -35,7 +35,8 @@ defmodule Filo.Batch do
   Runs each step in order, gated by its condition, returning a `Filo.BatchResult`.
 
   `exec_fun` runs one statement; `autocommit_fun` reports the connection's current
-  autocommit state, consulted by any `is_autocommit` conditions. A step whose
+  autocommit state, called only when a step's condition reaches an `is_autocommit` leaf
+  (and at most once per step) - plain `ok`/`error` chains never read it. A step whose
   condition is false is skipped — `nil` in both result and error positions.
   """
   @spec run(t(), exec_fun(), autocommit_fun()) :: BatchResult.t()
@@ -46,7 +47,7 @@ defmodule Filo.Batch do
     {results, errors, _outcomes, _next} =
       Enum.reduce(steps, {[], [], %{}, 0}, fn %{condition: condition, stmt: stmt},
                                               {results, errors, outcomes, idx} ->
-        run? = condition == nil or BatchCond.eval(condition, outcomes, autocommit_fun.())
+        run? = condition == nil or BatchCond.eval(condition, outcomes, autocommit_fun)
 
         {result, error, outcome} =
           if run? do
