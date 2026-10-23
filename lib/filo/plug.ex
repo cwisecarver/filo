@@ -772,7 +772,7 @@ defmodule Filo.Plug do
       %Plug.Conn.Unfetched{} ->
         case read_all(conn, "") do
           {:ok, raw, conn} ->
-            case Jason.decode(raw) do
+            case Filo.Json.decode(raw) do
               {:ok, params} when is_map(params) -> {:ok, params, conn}
               _ -> {:error, :bad_json, conn}
             end

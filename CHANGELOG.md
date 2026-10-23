@@ -7,6 +7,20 @@ Filo uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 version is below `1.0.0`, the **minor** number carries breaking changes as well as
 features; patch releases stay backward compatible.
 
+## [Unreleased]
+
+### Changed
+
+- **A WebSocket `open_cursor` holds its rows as one flattened binary per row**, not the
+  unflattened iodata execute/batch use (about 6x the heap, copied by every major GC of the
+  connection process while the cursor is open).
+- **JSON text cells are encoded with `:json.encode_binary/1`** (OTP 27+), with invalid UTF-8
+  caught and answered as a blob, instead of a `String.valid?/1` pre-scan plus Jason. Output is
+  byte-identical; 0.2 KB text cells encode several times faster.
+- **Inbound JSON (WebSocket frames, HTTP bodies) is decoded with `:json.decode/3`.** Same terms
+  and the same accept/reject decisions (trailing garbage still fails).
+- Docs: streams on one WebSocket run serially (see `Filo.Socket`).
+
 ## [0.4.2] — 2026-10-19
 
 Performance only. One additive, optional field (`Filo.StmtResult.cols_encoded`) and one

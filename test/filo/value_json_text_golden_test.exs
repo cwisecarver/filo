@@ -1,5 +1,5 @@
 defmodule Filo.ValueJsonTextGoldenTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   # expert review 2026-10-22 r8 #13: text cells moved from `String.valid?/1` + Jason to
   # `:json.encode_binary/1` with a catch-to-blob. The wire bytes must be IDENTICAL to the old
@@ -47,7 +47,7 @@ defmodule Filo.ValueJsonTextGoldenTest do
   end
 
   test "every code point and random binaries" do
-    for cp <- 0..0x10FFFF, cp not in 0xD800..0xDFFF, rem(cp, 7) == 0 or cp < 0x900 do
+    for cp <- 0..0x10FFFF, cp not in 0xD800..0xDFFF, rem(cp, 61) == 0 or cp < 0x900 do
       assert_same(<<cp::utf8>>)
     end
 

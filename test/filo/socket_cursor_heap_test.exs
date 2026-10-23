@@ -22,7 +22,7 @@ defmodule Filo.SocketCursorHeapTest.Big do
 end
 
 defmodule Filo.SocketCursorHeapTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   # expert review 2026-10-22 r8 #6: a WebSocket open_cursor keeps its whole result in socket
   # state across fetch_cursor round trips. Stored as unflattened iodata (rows: :json_iodata) it
