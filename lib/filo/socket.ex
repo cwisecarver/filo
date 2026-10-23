@@ -504,7 +504,7 @@ defmodule Filo.Socket do
                 fn -> state.executor.autocommit?(conn) end
               )
 
-            entries = Cursor.entries(result, rows_opt(state))
+            entries = Cursor.entries(result, cursor_rows_opt(state))
 
             {{:ok, %{"type" => "open_cursor"}},
              %{state | cursors: Map.put(state.cursors, cid, entries)}}
@@ -641,6 +641,14 @@ defmodule Filo.Socket do
   # expert review 2026-10-01 #37).
   defp rows_opt(%{encoding: :json}), do: [rows: :json_iodata]
   defp rows_opt(%{encoding: :protobuf}), do: [rows: :protobuf]
+
+  # An open_cursor's entries live in socket state across fetch_cursor round trips, so they are
+  # stored as one flattened binary per row (:json), not the unflattened iodata execute/batch use
+  # (:json_iodata) - that is sent at once, a held cursor is not. Iodata measured ~6x the heap
+  # (354k vs ~50k words for 2000x8 cells) and was copied by every major GC of the connection
+  # process (expert review 2026-10-22 r8 #6).
+  defp cursor_rows_opt(%{encoding: :json}), do: [rows: :json]
+  defp cursor_rows_opt(state), do: rows_opt(state)
 
   defp stored_sql_bytes(sqls),
     do: Enum.reduce(sqls, 0, fn {_id, sql}, acc -> acc + byte_size(sql) end)
