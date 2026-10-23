@@ -52,27 +52,43 @@ defmodule Filo.Value do
   intermediate layer roughly doubled it. This emits the final wire bytes directly —
   five value shapes, all trivially concatenable. Text is escaped by `:json.encode_binary/1`
   and floats use `:erlang.float_to_binary/2`, both byte-identical to the Jason map path
-  (pinned by test); an invalid-UTF-8 binary falls back to blob exactly as `encode/1` does.
+  (pinned by test); an invalid-UTF-8 binary falls back to blob exactly as `encode/1` does,
+  without raising.
 
-  ## Text cells: `:json.encode_binary/1` with a catch, no pre-scan
+  ## Text cells: a `:fast_ascii` validity check, then `:json.encode_binary/1`
 
-  A text cell is encoded with OTP's `:json.encode_binary/1` (OTP 27+; fathom's floor is 28),
-  which validates UTF-8 while it escapes, so the separate `String.valid?/1` walk is gone. An
-  invalid binary makes it `error({:invalid_byte, _, _})`, which is caught and answered as a
-  blob. Output is byte-identical to the former `Jason.encode_to_iodata!/1` path (pinned by a
+  A text cell is escaped by OTP's `:json.encode_binary/1` (OTP 27+; fathom's floor is 28).
+  Output is byte-identical to the former `Jason.encode_to_iodata!/1` path (pinned by a
   golden/property test over ASCII, multibyte, U+2028/2029, controls, quotes, backslashes and
-  random binaries). Measured (expert review 2026-10-22 r8 #13): 4-7x faster per cell.
+  random binaries). Validity is checked first with `String.valid?(v, :fast_ascii)`, and an
+  invalid binary is answered as a blob WITHOUT calling the encoder.
 
-  ## Why catching is fine here (and Jason's rescue was not)
+  ## Why there is a pre-check again (the blob cliff, third time)
 
   A blob arrives as a bare binary - a SQLite driver hands back a plain binary for both TEXT
   and BLOB cells - and random bytes are essentially never valid UTF-8, so a blob cell takes
-  the failure branch on every value. With Jason that meant raise/rescue of an exception
-  struct (stacktrace and all): 32.84 us/value at 64 bytes, vs 0.225 us for a `String.valid?`
-  pre-scan, which is why the pre-scan was added (146x on blobs). `:json` raises a plain
-  `error` term with no exception struct, and catching it measured 69 ns, so the pre-scan can
-  go: no cost on text, no cliff on blobs. `Jason.encode_to_iodata/2` (non-bang) is still not
-  an option: it builds the error struct (22.5 us/value).
+  the failure branch on every value.
+
+    * r4: Jason raise/rescue of an exception struct, 32.84 us/value at 64 bytes, vs 0.225 us
+      for a `String.valid?/1` pre-scan (146x). Fixed by the pre-scan.
+    * r8 #13 (fathom expert review 2026-10-22) dropped the pre-scan and let `:json`'s
+      `error({:invalid_byte, _})` be caught, on a measured 69 ns catch. That number does not
+      hold where rows are actually encoded: `error/3` with `error_info` plus the raise cost
+      ~1.4 us per blob cell at the top of the stack and grows with stack depth (3.2 us at
+      depth 1000, 8.8 us at 5000 - and `rows_iodata/1`'s body-recursive map runs one frame
+      per row deep). On fathom's keystone result (1000 rows, ~1.7 blob cells per row) that
+      cost more than the text speedup saved: `wire_server_rows_per_s` fell 9% (175k -> 159k,
+      3/3 runs) where the review expected a rise.
+    * Now: `String.valid?(v, :fast_ascii)` first. Per cell, keystone cells, min of 21
+      (loaded host, relative only): text 145 ns (Jason path 194, catch-only 71); blob 143 ns
+      (Jason path 97, catch-only 1,367); 1 KB ASCII 694 ns (Jason path 3,610, catch-only
+      546; plain `String.valid?/1` would be 2,516). Break-even against catch-only is about
+      one blob per 17 text cells, and the pre-check has no cliff.
+
+  The `catch` stays as belt and braces: `String.valid?/2` already guarantees `:json` accepts
+  the binary, so it should be unreachable, and costs nothing when nothing raises.
+  `Jason.encode_to_iodata/2` (non-bang) is still not an option: it builds the error struct
+  (22.5 us/value).
 
   The protobuf transports keep consuming `encode/1`'s maps — this is JSON-only.
   """
@@ -89,11 +105,16 @@ defmodule Filo.Value do
     do: [~S({"type":"blob","base64":"), encode_base64(v), ~S("})]
 
   def encode_json(v) when is_binary(v) do
-    [~S({"type":"text","value":), :json.encode_binary(v), ?}]
-  catch
     # Not valid UTF-8 (SQLite TEXT can legally hold it, and every BLOB arrives here as a bare
-    # binary) - same blob fallback as encode/1. `:json` raises a plain error term, which is
-    # cheap to catch (69 ns), unlike Jason's exception struct.
+    # binary): the same blob fallback as encode/1, reached WITHOUT raising - a caught `:json`
+    # error costs ~1.4 us and up per blob cell (see the moduledoc above).
+    if String.valid?(v, :fast_ascii) do
+      [~S({"type":"text","value":), :json.encode_binary(v), ?}]
+    else
+      [~S({"type":"blob","base64":"), encode_base64(v), ~S("})]
+    end
+  catch
+    # Belt and braces: unreachable while String.valid?/2 and :json agree on UTF-8.
     :error, _ -> [~S({"type":"blob","base64":"), encode_base64(v), ~S("})]
   end
 

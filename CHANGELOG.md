@@ -14,9 +14,11 @@ features; patch releases stay backward compatible.
 - **A WebSocket `open_cursor` holds its rows as one flattened binary per row**, not the
   unflattened iodata execute/batch use (about 6x the heap, copied by every major GC of the
   connection process while the cursor is open).
-- **JSON text cells are encoded with `:json.encode_binary/1`** (OTP 27+), with invalid UTF-8
-  caught and answered as a blob, instead of a `String.valid?/1` pre-scan plus Jason. Output is
-  byte-identical; 0.2 KB text cells encode several times faster.
+- **JSON text cells are encoded with `:json.encode_binary/1`** (OTP 27+) after a
+  `String.valid?(v, :fast_ascii)` check, instead of a `String.valid?/1` pre-scan plus Jason.
+  Output is byte-identical; text cells encode ~1.3x (short) to ~5x (1 KB ASCII) faster, and a
+  blob cell still never raises (catching `:json`'s invalid-byte error instead cost ~1.4 us and
+  up per blob cell, growing with stack depth).
 - **Inbound JSON (WebSocket frames, HTTP bodies) is decoded with `:json.decode/3`.** Same terms
   and the same accept/reject decisions (trailing garbage still fails).
 - Docs: streams on one WebSocket run serially (see `Filo.Socket`).
