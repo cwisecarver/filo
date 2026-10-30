@@ -9,8 +9,27 @@ features; patch releases stay backward compatible.
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-10-29
+
+Performance only. The API changes are additive (a `rows: :json_iodata` mode for
+`Filo.StmtResult`, a 0-arity function form for `Filo.BatchCond.eval/3`'s autocommit argument, a
+`json_chunk_bytes` option to `Filo.Stream.run_cursor`); nothing is removed, no `Filo.Executor`
+callback changes, and wire bytes are identical, so this is a patch release.
+
 ### Changed
 
+- **Float cells are encoded with `:erlang.float_to_binary(f, [:short])`**, which is what Jason
+  does on OTP 25+, so the output is byte-identical.
+- **Execute and batch rows stay unflattened on same-process transports.** A new
+  `Filo.StmtResult` `rows: :json_iodata` mode keeps each row as iodata; the WebSocket path and
+  the HTTP one-shot pipeline use it, and the baton path keeps `:json`.
+- **The `Filo.Streams` Registry is partitioned by `schedulers_online`.**
+- **Batches read autocommit only when a condition asks for it.** `Filo.BatchCond.eval/3`
+  accepts a 0-arity function and calls it at most once per step, only on an `is_autocommit`
+  leaf, so an ok-chain (django-libsql `executemany`) no longer reads it per step.
+- **`/v3/cursor` encodes its JSON body in the stream process** and splices
+  `StmtResult.cols_encoded`, so the reply crosses processes as refc binaries instead of a
+  structural copy of the batch result.
 - **A WebSocket `open_cursor` holds its rows as one flattened binary per row**, not the
   unflattened iodata execute/batch use (about 6x the heap, copied by every major GC of the
   connection process while the cursor is open).
