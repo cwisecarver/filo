@@ -166,6 +166,39 @@ defmodule Filo.PlugHardeningTest do
         assert conn.status == 400, "#{path} #{inspect(body)} -> #{conn.status}"
       end
     end
+
+    # fathom expert review 2026-11-07: an endless varint cost O(n^2) in the wire decoder, which
+    # runs before authorization. Invariant: a 400, quickly, and authorize is never consulted.
+    test "an endless protobuf varint is a fast 400 before authorization", %{key: key} do
+      opts = plug_opts(key, authorize: fn _arg, _token -> flunk("authorized") end)
+      body = <<8>> <> :binary.copy(<<0xFF>>, 200_000) <> <<0>>
+
+      for path <- ["/v3-protobuf/pipeline", "/v3-protobuf/cursor"] do
+        {micros, conn} = :timer.tc(fn -> post(opts, path, body, "application/x-protobuf") end)
+        assert conn.status == 400, "#{path} -> #{conn.status}"
+        assert micros < 100_000, "#{path} took #{div(micros, 1000)} ms"
+      end
+    end
+
+    test "an integer outside int64 is a 400 FILO_BAD_REQUEST and never reaches the executor",
+         %{key: key} do
+      opts = plug_opts(key)
+      big = %{"type" => "integer", "value" => "9223372036854775808"}
+
+      assert_bad_request(
+        post(opts, "/v1/execute", %{"stmt" => %{"sql" => "SELECT ?", "args" => [big]}})
+      )
+
+      pipeline =
+        post(opts, "/v3/pipeline", %{
+          "requests" => [
+            %{"type" => "execute", "stmt" => %{"sql" => "SELECT ?", "args" => [big]}}
+          ]
+        })
+
+      assert pipeline.status == 200
+      assert [%{"error" => %{"code" => "FILO_BAD_REQUEST"}}] = decoded(pipeline)["results"]
+    end
   end
 
   # H7 (fathom panel2 2026-10-10): the 8 MB constant was passed as read_body's per-call length, but

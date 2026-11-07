@@ -120,9 +120,16 @@ defmodule Filo.Protobuf.Wire do
 
   defp decode_varint(bin), do: decode_varint(bin, 0, 0)
 
-  defp decode_varint(<<1::1, group::7, rest::binary>>, shift, acc),
+  # A varint is at most 10 bytes (64 bits): the 10th, at shift 63, may only terminate and carry
+  # bit 63 alone. An unbounded loop would OR a growing bignum per continuation byte, O(n^2) on an
+  # attacker-chosen body that is decoded before authorization (fathom expert review 2026-11-07).
+  # Callers sit under `Filo.Error.guard/1` / `safe_decode_client_msg/1`, so the raise is a 400/close.
+  defp decode_varint(<<1::1, group::7, rest::binary>>, shift, acc) when shift < 63,
     do: decode_varint(rest, shift + 7, bor(acc, bsl(group, shift)))
 
-  defp decode_varint(<<0::1, group::7, rest::binary>>, shift, acc),
+  defp decode_varint(<<0::1, group::7, rest::binary>>, shift, acc) when shift < 63 or group <= 1,
     do: {bor(acc, bsl(group, shift)), rest}
+
+  defp decode_varint(<<_, _::binary>>, _shift, _acc),
+    do: raise(ArgumentError, "varint exceeds 64 bits")
 end

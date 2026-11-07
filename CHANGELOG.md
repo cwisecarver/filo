@@ -9,6 +9,22 @@ features; patch releases stay backward compatible.
 
 ## [Unreleased]
 
+### Security
+
+- **Protobuf varints are bounded to 10 bytes.** `Filo.Protobuf.Wire`'s decoder shifted an
+  unbounded accumulator, one bignum OR per continuation byte, so a body of `n` continuation bytes
+  cost O(n^2) (160,000 bytes ~1.1 s, 640,000 ~13.7 s). It is reached before authorization
+  (`/v3-protobuf/pipeline`, `/v3-protobuf/cursor`, and WebSocket protobuf frames before `hello`).
+  A varint longer than 10 bytes, or whose 10th byte carries more than bit 63, now raises, which
+  the existing `Filo.Error.guard/1` / socket decode guard answers as a 400 / close. Every
+  encoding Filo emits (negative `int64` is 10 bytes) is still accepted.
+- **`Filo.Value.decode/1` rejects integers outside `int64`.** A Hrana JSON `integer` whose string
+  is outside `-9223372036854775808..9223372036854775807` raises (a 400 `FILO_BAD_REQUEST`, or a
+  per-request error inside a pipeline) instead of reaching the executor as a bignum. Strings over
+  20 bytes are rejected without being parsed, so an 8 MB digit string no longer costs a bignum
+  build; the only previously-accepted input this refuses is an integer padded with more than 20
+  characters of leading zeros or sign.
+
 ## [0.4.3] — 2026-10-29
 
 Performance only. The API changes are additive (a `rows: :json_iodata` mode for

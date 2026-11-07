@@ -22,7 +22,7 @@ defmodule Filo.Value do
   @doc "Decodes a Hrana value map into a native Elixir term."
   @spec decode(t()) :: native()
   def decode(%{"type" => "null"}), do: nil
-  def decode(%{"type" => "integer", "value" => v}), do: String.to_integer(v)
+  def decode(%{"type" => "integer", "value" => v}), do: decode_int64(v)
   def decode(%{"type" => "float", "value" => v}), do: v * 1.0
   def decode(%{"type" => "text", "value" => v}), do: v
   def decode(%{"type" => "blob", "base64" => v}), do: {:blob, decode_base64(v)}
@@ -117,6 +117,24 @@ defmodule Filo.Value do
     # Belt and braces: unreachable while String.valid?/2 and :json agree on UTF-8.
     :error, _ -> [~S({"type":"blob","base64":"), encode_base64(v), ~S("})]
   end
+
+  # Hrana integers are i64 carried as strings. The longest in-range string is 20 bytes
+  # ("-9223372036854775808"), so a longer one is rejected before `String.to_integer/1` builds a
+  # bignum from it (an 8 MB digit string is attacker-chosen work); a shorter one is range-checked.
+  # Raises `ArgumentError`, which `Filo.Error.guard/1` turns into a 400 (fathom expert review
+  # 2026-11-07).
+  @min_i64 -0x8000000000000000
+  @max_i64 0x7FFFFFFFFFFFFFFF
+
+  defp decode_int64(v) when is_binary(v) and byte_size(v) <= 20 do
+    case String.to_integer(v) do
+      n when n in @min_i64..@max_i64 -> n
+      _ -> raise ArgumentError, "integer #{v} is outside the signed 64-bit range"
+    end
+  end
+
+  defp decode_int64(v) when is_binary(v),
+    do: raise(ArgumentError, "integer is outside the signed 64-bit range")
 
   # Hrana uses standard base64 without padding, and tolerates trailing padding
   # on input.

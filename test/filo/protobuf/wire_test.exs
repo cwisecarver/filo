@@ -83,6 +83,72 @@ defmodule Filo.Protobuf.WireTest do
     end
   end
 
+  # fathom expert review 2026-11-07: decode_varint shifted an unbounded accumulator, one bignum
+  # OR per continuation byte, so a body of n continuation bytes cost O(n^2) - reached before
+  # authorization. A varint is at most 10 bytes (the 10th may carry only bit 63).
+  describe "varint length bound" do
+    @max_u64 0xFFFFFFFFFFFFFFFF
+
+    test "an 11-byte varint raises" do
+      assert_raise ArgumentError, fn ->
+        Wire.decode_fields(<<8>> <> :binary.copy(<<0xFF>>, 11) <> <<0>>)
+      end
+    end
+
+    test "a 10th byte carrying more than bit 63 raises, in both terminator and continuation form" do
+      nine = :binary.copy(<<0xFF>>, 9)
+      assert_raise ArgumentError, fn -> Wire.decode_fields(<<8>> <> nine <> <<0x02>>) end
+      assert_raise ArgumentError, fn -> Wire.decode_fields(<<8>> <> nine <> <<0x81, 0>>) end
+    end
+
+    test "a length prefix is bounded too" do
+      assert_raise ArgumentError, fn ->
+        Wire.decode_fields(<<10>> <> :binary.copy(<<0xFF>>, 11) <> <<0>>)
+      end
+
+      assert_raise ArgumentError, fn ->
+        Wire.split_delimited(:binary.copy(<<0xFF>>, 11) <> <<0>>)
+      end
+    end
+
+    test "200,000 continuation bytes fail fast (was quadratic: > 1.5 s)" do
+      body = <<8>> <> :binary.copy(<<0xFF>>, 200_000) <> <<0>>
+
+      {micros, result} =
+        :timer.tc(fn ->
+          try do
+            Wire.decode_fields(body)
+          rescue
+            e in ArgumentError -> {:raised, e}
+          end
+        end)
+
+      assert {:raised, %ArgumentError{}} = result
+      assert micros < 50_000, "took #{div(micros, 1000)} ms"
+    end
+
+    test "int64 extremes round-trip, and negative int64 is a 10-byte varint" do
+      for n <- [9_223_372_036_854_775_807, -9_223_372_036_854_775_808, -1, 0, 1] do
+        [{1, {:varint, u}}] = Wire.decode_fields(bin(Wire.field_int(1, n)))
+        assert u == Bitwise.band(n, @max_u64)
+        assert if(u >= 0x8000000000000000, do: u - 0x10000000000000000, else: u) == n
+
+        [{1, {:varint, z}}] = Wire.decode_fields(bin(Wire.field_sint64(1, n)))
+        assert Wire.zigzag_decode(z) == n
+      end
+
+      # tag byte + 10 varint bytes
+      assert byte_size(bin(Wire.field_int(1, -1))) == 11
+      assert byte_size(bin(Wire.field_int(1, -9_223_372_036_854_775_808))) == 11
+      assert byte_size(bin(Wire.field_sint64(1, -9_223_372_036_854_775_808))) == 11
+    end
+
+    test "the largest uint64 (a 10-byte varint ending in 0x01) decodes" do
+      assert Wire.decode_fields(<<8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01>>) ==
+               [{1, {:varint, @max_u64}}]
+    end
+  end
+
   describe "delimit" do
     test "length-prefixes a message" do
       assert bin(Wire.delimit("hi")) == <<0x02, ?h, ?i>>

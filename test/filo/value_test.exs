@@ -20,6 +20,26 @@ defmodule Filo.ValueTest do
                -9_223_372_036_854_775_808
     end
 
+    # fathom expert review 2026-11-07: String.to_integer accepted any size, so an out-of-range
+    # bind reached the executor. Hrana integers are i64 (libsql parses them as i64 and rejects
+    # the rest); decode raises and Error.guard turns that into a 400 FILO_BAD_REQUEST.
+    test "integer outside the signed 64-bit range raises" do
+      for v <- ["9223372036854775808", "-9223372036854775809", "18446744073709551616"] do
+        assert_raise ArgumentError, fn -> Value.decode(%{"type" => "integer", "value" => v}) end
+      end
+    end
+
+    test "a huge digit string is rejected without parsing it into a bignum" do
+      v = String.duplicate("9", 1_000_000)
+
+      {micros, _} =
+        :timer.tc(fn ->
+          assert_raise ArgumentError, fn -> Value.decode(%{"type" => "integer", "value" => v}) end
+        end)
+
+      assert micros < 50_000, "took #{div(micros, 1000)} ms"
+    end
+
     test "float -> float" do
       assert Value.decode(%{"type" => "float", "value" => 3.14}) == 3.14
     end
